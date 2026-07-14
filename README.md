@@ -3,12 +3,10 @@
 <div align="center">
 
 ![SillyTavern Extension](https://img.shields.io/badge/SillyTavern-Extension-orange?style=for-the-badge)
-![Version](https://img.shields.io/badge/version-0.6.9-blue?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-0.11.0-blue?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
 
-**Organize your SillyTavern chats, search and delete**
-
-[Features](#-features) • [Installation](#-installation) • [Usage](#-usage)
+**Organize, search, and actually find your SillyTavern chats**
 
 </div>
 
@@ -16,53 +14,38 @@
 
 ## ✨ Features
 
-- **📂 Per-Character Folders** - Each character has independent folder sets
-- **🔍 Search Highlighting!** - Actually see what you are looking for!
-- **🗑️ Bulk Deletion** - Select many chats, delete many chats
-- **↕️ Sorting** - By number of messages, file size, date, name
-- **🔄 Collapsible** - Click folder headers to expand/collapse
-- **🖱️ Right-Click Menu** - Move chats between folders instantly
-- **🎨 Native Theme** - Blends seamlessly with SillyTavern's UI
-- **💾 Persistent** - Folder states saved across sessions
-- **📱 Mobile Friendly** - Full-screen popup on mobile devices
-
----
+- **⏱️ True "last active" sort** — chats ordered by when you last touched them
+  (opened / messaged / edited), not by the last message's copied date. Fresh
+  branches of old chats sort to the **top**, matching the Recent screen.
+- **⑂ Branch family view** — one section per lineage: the parent chat plus all
+  of its branches together, ordered, with `↳ branch` chips showing parentage
+  (from chat metadata, filename-pattern fallback).
+- **🟠 Open-chat marker** — the chat you're in gets an accent border, an `OPEN`
+  chip, a dot on its containing folder, auto-scroll on popup open, and a
+  crosshair button to jump back to it anytime.
+- **📂 Per-character folders** — every character card has its own independent
+  folder sets, pins, and collapse states. Nothing leaks across cards.
+- **🔍 Search with evidence** — matches show a highlighted context snippet of
+  where your term actually appears, not just the last message.
+- **🗑️ Bulk actions** — select many, move or delete many. Works in group chats.
+- **📌 Pins, ↕️ sorting** (activity / last-message / name / size / count),
+  **🎨 folder colors**, **📱 mobile-friendly**.
 
 ## 📦 Installation
 
 1. Open SillyTavern → **Extensions** → **Install Extension**
-2. Paste: `https://github.com/kristalium/SillyTavern-Too-Many-Chats`
+2. Paste: `https://github.com/brucestarkallen/SillyTavern-Too-Many-Chats`
 3. Click **Install** and refresh
-
----
 
 ## 🚀 Usage
 
-### Create Folders
-Click the **New Folder** button in the Chat History header
-
-### Organize Chats
-**Right-click** any chat → Select destination folder
-
-### Collapse/Expand
-Click any folder header to toggle visibility
-
-### Manage Folders
-Hover over a folder → Click ✏️ to rename or 🗑️ to delete
-
-### Bulk delete
-Press select, select, delete
----
+- **Families** button — toggle branch-lineage sections for the current character
+- **Right-click** (or ⋮ on mobile) any chat — pin, rename, delete, move to folder
+- **Crosshair** button — scroll back to the chat you have open
+- Folder headers collapse on click; hover for rename / color / delete
 
 ## 📄 License
 
-[MIT License](LICENSE)
-
----
-
-<div align="center">
-
-Original author - [chaaruze](https://github.com/chaaruze)
-
-Picked up and continued by me, hello.
-</div>
+[MIT](LICENSE) — original author [chaaruze](https://github.com/chaaruze),
+continued by Kristalium, this fork maintained by
+[brucestarkallen](https://github.com/brucestarkallen).

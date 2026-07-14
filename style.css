@@ -753,3 +753,137 @@
     margin-bottom: 10px;
 
 }
+
+/* ========== v0.7.0: ACTIVE CHAT MARKER ========== */
+.tmc_proxy_block.tmc_active {
+    border-left: 3px solid var(--SmartThemeQuoteColor, #e0a044) !important;
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 12%, transparent) !important;
+}
+
+.tmc_active_chip {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 7px;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1.4;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-radius: 8px;
+    color: var(--SmartThemeBlurTintColor, #1a1a1a);
+    background: var(--SmartThemeQuoteColor, #e0a044);
+    vertical-align: middle;
+    pointer-events: none;
+}
+
+/* Dot on folder headers containing the open chat (visible while collapsed
+   or when the chat is beyond the 3-item main-view truncation) */
+.tmc_section.tmc_has_active > .tmc_header .tmc_name::after {
+    content: '●';
+    margin-left: 6px;
+    font-size: 9px;
+    color: var(--SmartThemeQuoteColor, #e0a044);
+    vertical-align: middle;
+}
+
+/* ========== v0.8.0: BRANCH CHIP ========== */
+.tmc_branch_chip {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    font-size: 10px;
+    line-height: 1.4;
+    border-radius: 8px;
+    color: var(--SmartThemeBodyColor, #ccc);
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #ccc) 35%, transparent);
+    opacity: 0.75;
+    vertical-align: middle;
+    pointer-events: none;
+    white-space: nowrap;
+}
+
+/* ========== v0.10.0: BRANCH FAMILY VIEW ========== */
+.tmc_section.tmc_family > .tmc_header {
+    border-left: 3px solid color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 55%, transparent);
+    cursor: pointer;
+}
+
+.tmc_section.tmc_family[data-collapsed="true"] > .tmc_header .tmc_toggle i {
+    transform: rotate(-90deg);
+}
+
+.tmc_family_btn.tmc_toggle_on {
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 25%, transparent) !important;
+    box-shadow: inset 0 0 0 1px var(--SmartThemeQuoteColor, #e0a044);
+}
+
+/* ========== v0.11.0: JUMP-TO-OPEN FLASH ========== */
+.tmc_proxy_block.tmc_flash {
+    animation: tmc_flash_kf 1.2s ease-out;
+}
+@keyframes tmc_flash_kf {
+    0%   { box-shadow: inset 0 0 0 2px var(--SmartThemeQuoteColor, #e0a044); }
+    100% { box-shadow: inset 0 0 0 0 transparent; }
+}
+
+/* ========== v0.12.0: CARDS BROWSER + CHARACTER PICKER ========== */
+.tmc_cards_note {
+    padding: 6px 10px;
+    font-size: 11px;
+    opacity: 0.65;
+}
+
+.tmc_card_section > .tmc_header {
+    border-left: 3px solid color-mix(in srgb, var(--SmartThemeBodyColor, #ccc) 30%, transparent);
+}
+
+.tmc_card_chat {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 6px 10px 6px 26px;
+    cursor: pointer;
+    border-radius: 6px;
+}
+.tmc_card_chat:hover {
+    background: color-mix(in srgb, var(--SmartThemeBodyColor, #ccc) 10%, transparent);
+}
+.tmc_card_chat_title {
+    font-size: 13px;
+}
+.tmc_card_chat_preview {
+    font-size: 11px;
+    opacity: 0.55;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tmc_charpicker_filter {
+    background: color-mix(in srgb, var(--SmartThemeBodyColor, #ccc) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBodyColor, #ccc) 25%, transparent);
+    border-radius: 6px;
+    padding: 5px 8px;
+    color: inherit;
+}
+
+/* ========== v0.12.1: MOVE FEEDBACK + ACTIVITY HINT ========== */
+.tmc_ctx_item.tmc_ctx_current {
+    opacity: 0.8;
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 12%, transparent);
+}
+
+.tmc_activity_hint {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    font-size: 10px;
+    line-height: 1.4;
+    border-radius: 8px;
+    color: var(--SmartThemeQuoteColor, #e0a044);
+    border: 1px dashed color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 45%, transparent);
+    opacity: 0.85;
+    vertical-align: middle;
+    pointer-events: none;
+    white-space: nowrap;
+}
