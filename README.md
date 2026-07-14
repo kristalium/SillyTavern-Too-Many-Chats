@@ -3,7 +3,7 @@
 <div align="center">
 
 ![SillyTavern Extension](https://img.shields.io/badge/SillyTavern-Extension-orange?style=for-the-badge)
-![Version](https://img.shields.io/badge/version-0.11.0-blue?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-0.12.2-blue?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
 
 **Organize, search, and actually find your SillyTavern chats**
@@ -34,7 +34,7 @@
 ## 📦 Installation
 
 1. Open SillyTavern → **Extensions** → **Install Extension**
-2. Paste: `https://github.com/brucestarkallen/SillyTavern-Too-Many-Chats`
+2. Paste: `https://github.com/kristalium/SillyTavern-Too-Many-Chats`
 3. Click **Install** and refresh
 
 ## 🚀 Usage
@@ -47,5 +47,4 @@
 ## 📄 License
 
 [MIT](LICENSE) — original author [chaaruze](https://github.com/chaaruze),
-continued by Kristalium, this fork maintained by
-[brucestarkallen](https://github.com/brucestarkallen).
+continued by me and [brucestarkallen](https://github.com/brucestarkallen) and everyone else
