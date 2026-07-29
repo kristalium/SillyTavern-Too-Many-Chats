@@ -501,6 +501,7 @@ console.log('[36] moveChatToCharacter: loss-safe pipeline ordering');
         + '\nconst getSettings = () => settingsObj; const saveSettings = () => {}; const scheduleSync = () => {};'
         + '\nconst findNativeBlock = () => null; const pruneLastActive = () => {};'
         + '\n' + extract('normalizeChatId') + '\n' + extract('stHeaders') + '\n' + extract('adaptChatForTarget') + '\n' + extract('pickFreeName')
+        + '\n' + extract('stripDeletedFromFolders')
         + '\nasync ' + extract('moveChatToCharacter')
         + '\nreturn { move: moveChatToCharacter, settings: () => settingsObj };')(
         mkFetch(opts), { getContext: () => ({ getRequestHeaders: () => ({}) }) }, { }, console);
@@ -585,6 +586,180 @@ console.log('[40] Feedback wiring');
     assert(cf.includes('return folderId;') && cf.includes('return null;'), 'createFolder returns fid / null');
     const cpb = stripComments(extract('createProxyBlock'));
     assert(cpb.includes('tmc_activity_hint') && cpb.includes('shownDate + 60000'), 'stamp-driven ordering surfaced as a chip when it outranks the visible date');
+}
+
+console.log('[41] partitionPinned: pins float without inverting their order');
+{
+    const fn = new Function(extract('partitionPinned') + '\nreturn partitionPinned;')();
+    const list = ['p1', 'a', 'p2', 'b', 'p3'];
+    const isPin = x => x.startsWith('p');
+    assert(fn(list, isPin).join('|') === 'p1|p2|p3|a|b', 'pinned cluster keeps global sort order, rest follows');
+    // negative proof: the OLD unshift-per-pin flow produced the reverse
+    const old = []; for (const x of list) { if (isPin(x)) old.unshift(x); else old.push(x); }
+    assert(old.join('|') === 'p3|p2|p1|a|b', 'sanity: old flow really did invert pinned order (the bug)');
+    assert(fn([], isPin).length === 0 && fn(null, isPin).length === 0, 'empty / null inputs safe');
+}
+
+console.log('[42] reuseCachedNative: survives ST rebuilding blocks per search keystroke');
+{
+    const fn = new Function(extract('reuseCachedNative') + '\nreturn reuseCachedNative;')();
+    const mk = (text) => { const d = document.createElement('div'); d.textContent = text; return d; };
+    const b1 = mk('Tale  Jul 29, 2026 4:00 PM (2KB, 12 msgs) last line');
+    const cached = { element: b1, signature: b1.textContent, html: '<i>parsed</i>' };
+    assert(fn(cached, b1) === true, 'identity hit still reuses');
+    const rebuilt = mk('Tale  Jul 29, 2026 4:00 PM (2KB, 12 msgs) last line');
+    assert(cached.element !== rebuilt, 'sanity: rebuilt block is a different element (identity-only cache missed here)');
+    assert(fn(cached, rebuilt) === true, 'rebuilt-but-identical block reuses the parse (THE fix)');
+    assert(cached.element === rebuilt, 'cache adopts the new element');
+    const changed = mk('Tale  Jul 29, 2026 4:05 PM (3KB, 13 msgs) newer line');
+    assert(fn(cached, changed) === false, 'real content change invalidates (new message -> re-parse)');
+    assert(fn(undefined, b1) === false, 'no cache entry -> parse');
+    assert(fn({ element: mk('x') }, mk('')) === false, 'legacy entry without signature + different element -> re-parse, never false-reuse');
+}
+
+console.log('[43] migrateChatRename: rename keeps folder, pin, stamp, collapse state');
+{
+    const fn = new Function(extract('normalizeChatId') + '\n' + extract('migrateChatRename') + '\nreturn migrateChatRename;')();
+    const mk = () => ({
+        folders: { f1: { chats: ['Old Tale'] }, f2: { chats: ['Other'] }, fx: { chats: ['Old Tale'] } },
+        characterFolders: { 'A.png': ['f1', 'f2'], 'B.png': ['fx'] },
+        pinned: { 'A.png::Old Tale': true },
+        lastActive: { 'A.png::Old Tale': 1000 },
+        familyCollapsed: { 'A.png::Old Tale': true },
+    });
+    let s = mk();
+    assert(fn(s, 'A.png', 'Old Tale', 'New Tale') === true, 'reports change');
+    assert(s.folders.f1.chats.join('|') === 'New Tale', 'folder membership follows the rename');
+    assert(s.folders.fx.chats.join('|') === 'Old Tale', 'other character\'s same-named chat untouched');
+    assert(s.pinned['A.png::New Tale'] === true && !('A.png::Old Tale' in s.pinned), 'pin follows');
+    assert(s.lastActive['A.png::New Tale'] === 1000 && !('A.png::Old Tale' in s.lastActive), 'stamp follows');
+    assert(s.familyCollapsed['A.png::New Tale'] === true && !('A.png::Old Tale' in s.familyCollapsed), 'family collapse state follows');
+    // stamp max-merge: never clobber a NEWER stamp already under the new name
+    s = mk(); s.lastActive['A.png::New Tale'] = 5000;
+    fn(s, 'A.png', 'Old Tale', 'New Tale');
+    assert(s.lastActive['A.png::New Tale'] === 5000, 'newer stamp under the new name wins (max-merge)');
+    // ghost dedupe: renaming onto a name with a stale ghost entry
+    s = mk(); s.folders.f1.chats = ['Old Tale', 'New Tale'];
+    fn(s, 'A.png', 'Old Tale', 'New Tale');
+    assert(s.folders.f1.chats.join('|') === 'New Tale', 'ghost entry under the new name deduped');
+    assert(fn(mk(), 'A.png', 'Same', 'Same') === false, 'same-name rename is a no-op');
+    assert(fn(mk(), 'A.png', 'Never Existed', 'X') === false, 'unknown chat is a clean no-op');
+}
+
+console.log('[44] stripDeletedFromFolders: normalized cleanup incl. pin + stamp');
+{
+    const fn = new Function(extract('normalizeChatId') + '\n' + extract('stripDeletedFromFolders') + '\nreturn stripDeletedFromFolders;')();
+    const s = {
+        folders: { f1: { chats: ['Tale', 'Keep'] } },
+        characterFolders: { 'A.png': ['f1'] },
+        pinned: { 'A.png::Tale': true, 'A.png::Keep': true },
+        lastActive: { 'A.png::Tale': 42, 'A.png::Keep': 43 },
+    };
+    // deleted names arrive WITH .jsonl (block spelling on some builds)
+    assert(fn(s, 'A.png', ['Tale.jsonl']) === true, 'reports change');
+    assert(s.folders.f1.chats.join('|') === 'Keep', 'normalized match removed the assignment');
+    assert(!('A.png::Tale' in s.pinned) && s.pinned['A.png::Keep'] === true, 'pin dropped for deleted, kept for others');
+    assert(!('A.png::Tale' in s.lastActive) && s.lastActive['A.png::Keep'] === 43, 'stamp dropped for deleted, kept for others');
+    // negative proof: the OLD raw-includes comparison matched nothing here
+    assert(['Tale'].filter(f => !['Tale.jsonl'].includes(f)).length === 1, 'sanity: old raw includes() left the ghost behind (the bug)');
+    assert(fn(s, null, ['x']) === false && fn(s, 'A.png', []) === false, 'no character / empty list are clean no-ops');
+}
+
+console.log('[45] clampMenuToViewport: menus always land fully on-screen');
+{
+    const fn = new Function(extract('clampMenuToViewport') + '\nreturn clampMenuToViewport;')();
+    const mkMenu = (rect) => ({ getBoundingClientRect: () => rect, style: {} });
+    const win = { innerWidth: 390, innerHeight: 800 };
+    // kebab tap near the bottom-right of a phone screen
+    let m = mkMenu({ left: 300, top: 700, right: 460, bottom: 900, width: 160, height: 200 });
+    fn(m, win);
+    assert(m.style.left === '222px', 'right overflow clamped inside viewport (390-8-160)');
+    assert(m.style.top === '592px', 'bottom overflow clamped inside viewport (800-8-200)');
+    assert(m.style.right === 'auto', 'right anchor cleared so left wins');
+    // sanity: pre-clamp the menu really did hang off-screen
+    assert(900 > win.innerHeight && 460 > win.innerWidth, 'sanity: unclamped rect overflowed both edges (the bug)');
+    // a menu already fully visible is not moved
+    m = mkMenu({ left: 40, top: 60, right: 200, bottom: 260, width: 160, height: 200 });
+    fn(m, win);
+    assert(m.style.left === '40px' && m.style.top === '60px', 'already-visible menu stays put');
+    // a menu TALLER than the viewport pins to the top pad, not negative
+    m = mkMenu({ left: 10, top: 100, right: 170, bottom: 1000, width: 160, height: 900 });
+    fn(m, win);
+    assert(m.style.top === '8px', 'oversized menu pins to top padding, never negative');
+}
+
+console.log('[46] buildFolderList: existence-based, never name-based');
+{
+    const fn = new Function(extract('buildFolderList') + '\nreturn buildFolderList;')();
+    const s = {
+        folders: { f1: { name: '?' }, f2: { name: 'Real' } },
+        characterFolders: { 'A.png': ['f1', 'f2', 'fDeleted'] },
+    };
+    const out = fn(s, 'A.png');
+    assert(out.length === 2 && out[0].name === '?' && out[1].name === 'Real', 'folder literally named "?" is included (old filter dropped it)');
+    assert(!out.some(f => f.fid === 'fDeleted'), 'dangling folder id excluded');
+    assert(fn({}, 'A.png').length === 0, 'empty settings safe');
+}
+
+console.log('[47] Family dot: lights up when ANY member is the open chat');
+{
+    const deps = 'const getSettings = () => ({ familyCollapsed: {} });'
+        + '\nconst saveSettings = () => {}; const scheduleSync = () => {};'
+        + '\nconst familyCollapseKey = (r) => "c::" + r;'
+        + '\nconst isActiveChatFile = (f) => String(f).replace(/\\.jsonl$/i, "") === ACTIVE;';
+    const build = (active) => new Function('document', 'ACTIVE',
+        deps + '\n' + extract('escapeHtml') + '\n' + extract('createFamilyDOM')
+        + '\nreturn createFamilyDOM;')(document, active);
+    let section = build('Branch 1')('Root Tale', 2, ['Root Tale', 'Branch 1']);
+    assert(section.classList.contains('tmc_has_active'), 'open BRANCH lights the family dot (THE fix)');
+    section = build('Branch 1')('Root Tale', 2);
+    assert(!section.classList.contains('tmc_has_active'), 'sanity: root-only fallback (old behavior) misses the open branch');
+    section = build('Root Tale')('Root Tale', 2, ['Root Tale', 'Branch 1']);
+    assert(section.classList.contains('tmc_has_active'), 'open root still lights it');
+    section = build('Elsewhere')('Root Tale', 2, ['Root Tale', 'Branch 1']);
+    assert(!section.classList.contains('tmc_has_active'), 'no member open -> no dot');
+}
+
+console.log('[48] v0.13.0 wiring: every fix is actually connected');
+{
+    const ps = stripComments(extract('performSync'));
+    assert(ps.includes('const visibleData = sortedData.filter'), 'visibility decided once, upstream');
+    assert(ps.includes('visibleData.map(c => c.fileName'), 'family clustering sees only visible chats');
+    assert(ps.includes('visibleData.forEach(chat =>'), 'distribution iterates the visible list');
+    assert(!ps.includes('.unshift(chat)'), 'inverting unshift-per-pin is gone');
+    assert(ps.includes('partitionPinned(chatsByFolder[fid]'), 'pin partition wired into distribution');
+    assert(ps.includes("fid === 'uncategorized' || searchTerm"), 'empty sections hidden during search');
+    assert(ps.includes('reuseCachedNative(cached, block)'), 'cache reuse goes through the signature-aware check');
+    assert(ps.includes('signature: block.textContent'), 'fresh parses store their signature');
+
+    const rb = stripComments(extract('renderBatch'));
+    assert(rb.includes('chats.length, 3)'), 'main-view 3-cap applied via endIndex, upfront');
+    assert(!rb.includes('children[i].remove()'), 'render-then-delete waste is gone');
+
+    const cm = stripComments(extract('showContextMenu'));
+    assert((cm.match(/menu\.remove\(\)/g) || []).length === 1, 'exactly one menu.remove() — inside cleanup(); action paths use cleanup()');
+    assert(cm.includes('e.clientY') && cm.includes('e.clientX') && !cm.includes('e.pageY'), 'fixed-position menu uses client coords');
+    assert(cm.includes('clampMenuToViewport(menu)'), 'clamp runs after append');
+    assert(cm.includes('buildFolderList(settings, characterId)'), 'move-to list built existence-based');
+
+    const iab = stripComments(extract('injectAddButton'));
+    assert(iab.includes('clearSelection()'), 'entering Cards mode clears bulk selection');
+
+    const fpe = stripComments(extract('findPreviewElement'));
+    assert(fpe.indexOf('.select_chat_block_mes') < fpe.indexOf('querySelectorAll'), 'stable preview class tried before the heuristic');
+
+    const mv = stripComments(extract('moveChatToCharacter'));
+    assert(mv.includes('stripDeletedFromFolders(settings, sourceAvatar'), 'move-to-card uses the canonical cleanup');
+
+    const initSrc = stripComments(extract('init'));
+    assert(initSrc.includes('CHAT_RENAMED'), 'rename event subscribed (feature-detected)');
+    assert(initSrc.includes('migrateChatRename(settings, charKey, oldId, newId)'), 'rename handler migrates bookkeeping');
+    assert(initSrc.includes('activityData.fetchedAt = 0'), 'rename forces a branch-metadata refetch');
+
+    // stamp-drift gate: manifest version must equal both in-code stamps
+    const manifest = JSON.parse(readFileSync('./manifest.json', 'utf8'));
+    assert(src.includes(`v${manifest.version} Loading...`), `init log stamp matches manifest (${manifest.version})`);
+    assert(src.includes(` * v${manifest.version} - `), `header comment stamp matches manifest (${manifest.version})`);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
