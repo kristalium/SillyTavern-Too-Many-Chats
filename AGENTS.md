@@ -71,6 +71,11 @@ Rules that have bitten before:
   after append. Menus must always land fully on-screen.
 - Main-view 3-row folder truncation is applied via `endIndex` in
   `renderBatch` — never render-then-delete.
+- Search is a TRANSIENT LENS: while a term is active, sections holding
+  matches render forced-open (display + chevron) but the persisted
+  collapsed flag is never written; hide-empty applies in main/family modes
+  only — NEVER in folder view, whose single section header holds the Back
+  button. Continuation batches (sentinel) always pass `lastSearchTermSeen`.
 - Model-agnostic and ST-build-agnostic: every new-API use is
   feature-detected with graceful fallback; no hardcoded model identity.
 

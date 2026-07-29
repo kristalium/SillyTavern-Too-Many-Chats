@@ -1,9 +1,10 @@
 /**
  * Too Many Chats - SillyTavern Extension
  * Chat organization and stuff
- * v0.13.0 - Deep audit against current ST source: signature cache (search rebuilds blocks),
- *           pinned-order fix, CHAT_RENAMED bookkeeping migration, viewport-clamped menus,
- *           search hides empty sections, family open-dot, canonical delete bookkeeping
+ * v0.13.1 - Workflow-trace fixes: folder view keeps its header (Back button) on
+ *           zero-match searches; search force-opens collapsed sections holding
+ *           matches (persisted collapse untouched); lazy-scroll batches keep the
+ *           search term (highlight + snippets past the first slab)
  * @original author - chaaruze
  * @picked up by - Kristalium
  */
@@ -1448,7 +1449,11 @@
                         lazyObserver.unobserve(sentinel);
                         // Add small delay to smooth out rapid scrolling
                         setTimeout(() => {
-                            renderBatch(folderId, nextIndex, BATCH_SIZE);
+                            // v0.13.1: continuation batches must carry the
+                            // active search term, or rows lazy-loaded past
+                            // the first slab lose their title highlight and
+                            // context snippets mid-search.
+                            renderBatch(folderId, nextIndex, BATCH_SIZE, null, lastSearchTermSeen);
                         }, 50);
 
                     }
@@ -1762,8 +1767,23 @@
                 // is noise; folders are only useful as drop targets when
                 // NOT searching (v0.13.0).
                 const sectionCount = chatsByFolder[fid] ? chatsByFolder[fid].length : 0;
-                if (fid === 'uncategorized' || searchTerm) {
+                // v0.13.1: NEVER in folder view — that view has exactly one
+                // section and its header IS the navigation (Back button).
+                // Hiding it on a zero-match search left a blank panel with
+                // no way back.
+                if (currentView !== 'folder' && (fid === 'uncategorized' || searchTerm)) {
                     section.style.display = sectionCount > 0 ? '' : 'none';
+                }
+
+                // v0.13.1: search is a transient lens — matches inside a
+                // collapsed folder/family must be VISIBLE while a term is
+                // active (the header count said "3" while the rows sat at
+                // display:none). Forced open for this render only; the
+                // persisted collapsed flag is untouched, so clearing the
+                // search restores the user's collapse state exactly.
+                if (searchTerm && sectionCount > 0) {
+                    container.style.display = '';
+                    section.dataset.collapsed = 'false';
                 }
 
 
@@ -2835,7 +2855,7 @@
     // ========== INIT ==========
 
     function init() {
-        console.log(`[${EXTENSION_NAME}] v0.13.0 Loading...`);
+        console.log(`[${EXTENSION_NAME}] v0.13.1 Loading...`);
         const ctx = SillyTavern.getContext();
 
         // v0.11.0 one-time migration: normalize + dedupe stored folder chat

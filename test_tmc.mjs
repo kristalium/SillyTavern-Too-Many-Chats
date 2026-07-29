@@ -762,5 +762,27 @@ console.log('[48] v0.13.0 wiring: every fix is actually connected');
     assert(src.includes(` * v${manifest.version} - `), `header comment stamp matches manifest (${manifest.version})`);
 }
 
+console.log('[49] v0.13.1 workflow fixes: folder-view escape, search reveals matches, sentinel term');
+{
+    const ps = stripComments(extract('performSync'));
+    // A: hide-empty can never hide the folder-view section (Back button lives there)
+    assert(ps.includes("currentView !== 'folder' && (fid === 'uncategorized' || searchTerm)"),
+        'hide-empty guarded out of folder view (zero-match search kept the Back button)');
+    // C: active search force-opens sections that hold matches, render-only
+    assert(ps.includes('if (searchTerm && sectionCount > 0)'), 'search-expand branch exists');
+    const expandIdx = ps.indexOf('if (searchTerm && sectionCount > 0)');
+    const expandBlock = ps.slice(expandIdx, ps.indexOf('}', ps.indexOf('dataset.collapsed', expandIdx)) + 1);
+    assert(expandBlock.includes("container.style.display = ''"), 'matched section content forced visible');
+    assert(expandBlock.includes("section.dataset.collapsed = 'false'"), 'chevron reflects the forced-open state');
+    assert(!expandBlock.includes('saveSettings') && !expandBlock.includes('folders['),
+        'persisted collapse flag untouched by the search override (render-only)');
+    // B: lazy-scroll continuation carries the live term
+    const io = stripComments(extract('initIntersectionObserver'));
+    assert(io.includes('renderBatch(folderId, nextIndex, BATCH_SIZE, null, lastSearchTermSeen)'),
+        'sentinel batches carry the active search term');
+    assert(!io.includes('renderBatch(folderId, nextIndex, BATCH_SIZE);'),
+        'no term-less continuation path remains');
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

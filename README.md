@@ -3,7 +3,7 @@
 <div align="center">
 
 ![SillyTavern Extension](https://img.shields.io/badge/SillyTavern-Extension-orange?style=for-the-badge)
-![Version](https://img.shields.io/badge/version-0.13.0-blue?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-0.13.1-blue?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
 
 **Organize, search, and actually find your SillyTavern chats**
@@ -64,6 +64,17 @@ The suite includes a stamp-drift gate: `manifest.json` version must equal both
 in-code version stamps.
 
 ## 📜 Changelog
+
+- **0.13.1** — Full workflow-by-workflow trace of every code path. Three
+  fixes: folder view keeps its header on zero-match searches (the 0.13.0
+  hide-empty rule could hide the section containing the Back button — a
+  blank panel with no way out); an active search now force-opens collapsed
+  folders/families that hold matches, render-only (the header said "3"
+  while the matching rows sat hidden; clearing the search restores your
+  collapse state exactly); lazy-scroll continuation batches carry the live
+  search term (rows loaded past the first slab silently lost their
+  highlight and context snippets). 222 checks green, all guards
+  negative-tested.
 
 - **0.13.0** — Deep audit against current SillyTavern source. Root fixes:
   native-block parse cache now survives ST's search behavior (current ST
