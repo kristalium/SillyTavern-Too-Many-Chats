@@ -1,10 +1,12 @@
 /**
  * Too Many Chats - SillyTavern Extension
  * Chat organization and stuff
- * v0.13.1 - Workflow-trace fixes: folder view keeps its header (Back button) on
- *           zero-match searches; search force-opens collapsed sections holding
- *           matches (persisted collapse untouched); lazy-scroll batches keep the
- *           search term (highlight + snippets past the first slab)
+ * v0.14.0 - Audit vs live ST source: open-chat-safe bulk delete (ST's own
+ *           deleteCharacterChatByName/deleteGroupChatByName leave the deleted
+ *           chat loaded in memory), one canonical scroll container (scroll
+ *           preservation + lazy-load prefetch were rooted on a non-scrolling
+ *           element), header toggles reconciled from state, collision-safe
+ *           move-to-card, DOM-based highlighting, external-delete cleanup
  * @original author - chaaruze
  * @picked up by - Kristalium
  */
@@ -61,6 +63,12 @@
     let renderedCounts = {};  // section id -> items already rendered
     let lastScrollTop = 0;
     let lastSearchTermSeen = '';
+    // v0.14.0: identity of the list currently on screen (character, view,
+    // folder, family/flat, search term). Scroll position is only worth
+    // restoring across a rebuild of the SAME list; a different list should
+    // start at the top, which is what the user expects and what the old
+    // (dead) code accidentally always did.
+    let lastListIdentity = '';
     let lastSyncedCharacterId = null; // Track which character the proxy tree currently reflects
 
     // ========== SEARCH CONTEXT PREVIEW ==========
@@ -406,6 +414,25 @@
         return new Set((Array.isArray(results) ? results : []).map(r => normalizeChatId(r.file_name)));
     }
 
+    // Authoritative existence probe: goes through the same server-side path
+    // resolution (including sanitize()) that the save will use. A file that
+    // exists but is empty reads as absent — there is nothing in it to lose.
+    async function targetChatExists(avatar, name) {
+        try {
+            const res = await fetch('/api/chats/get', {
+                method: 'POST', headers: stHeaders(),
+                body: JSON.stringify({ avatar_url: avatar, file_name: name })
+            });
+            if (!res.ok) return false;
+            const data = await res.json();
+            return Array.isArray(data) && data.length > 0;
+        } catch (e) {
+            // Unknown is not "free": refuse to guess in the overwrite direction.
+            console.warn('[TMC] Destination existence probe failed:', name, e);
+            return true;
+        }
+    }
+
     // Never overwrite an existing chat on the target card.
     function pickFreeName(base, takenSet) {
         if (!takenSet.has(base)) return base;
@@ -416,6 +443,21 @@
         return `${base} ${Date.now()}`;
     }
 
+    // v0.14.0: a fresh integrity token for the copy. ST stamps every chat it
+    // loads with a uuid in chat_metadata.integrity and the server refuses a
+    // save whose token disagrees with the token already in the target file —
+    // that check is the last line of defence against clobbering someone
+    // else's chat, so the copy must carry its own token rather than inheriting
+    // the source's.
+    function freshIntegrity() {
+        try {
+            if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+                return crypto.randomUUID();
+            }
+        } catch { /* fall through */ }
+        return 'tmc-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+    }
+
     // Returns a NEW chat array adapted for the target card: header
     // character_name rewritten; AI messages whose speaker name equals the
     // SOURCE card's name are renamed to the target's. User messages and
@@ -424,7 +466,10 @@
         return chatArray.map((row, i) => {
             if (!row || typeof row !== 'object') return row;
             if (i === 0 && !('mes' in row)) {
-                return { ...row, character_name: targetName };
+                const meta = (row.chat_metadata && typeof row.chat_metadata === 'object')
+                    ? { ...row.chat_metadata, integrity: freshIntegrity() }
+                    : row.chat_metadata;
+                return { ...row, character_name: targetName, ...(meta ? { chat_metadata: meta } : {}) };
             }
             if (!row.is_user && sourceName && targetName && row.name === sourceName) {
                 return { ...row, name: targetName };
@@ -444,16 +489,32 @@
         const data = await getRes.json();
         if (!Array.isArray(data) || data.length === 0) return { ok: false, reason: 'empty or unreadable' };
 
-        // 2. adapt + collision-free name
+        // 2. adapt + collision-free name.
+        // v0.14.0: the listing-derived takenSet picks a candidate cheaply, but
+        // it is NOT authoritative — /api/chats/save runs the destination
+        // through sanitize(), so a name the listing said was free can still
+        // land on an existing file. Probe the real path for each candidate.
         const adapted = adaptChatForTarget(data, sourceName, target.name);
-        const destName = pickFreeName(id, takenSet);
+        let destName = null;
+        let candidate = pickFreeName(id, takenSet);
+        for (let attempt = 0; attempt < 6; attempt++) {
+            if (!await targetChatExists(target.avatar, candidate)) { destName = candidate; break; }
+            takenSet.add(candidate); // occupied — never offer this name again
+            candidate = pickFreeName(id, takenSet);
+        }
+        if (!destName) {
+            return { ok: false, reason: 'no free name on the target card (source untouched)' };
+        }
         takenSet.add(destName);
 
-        // 3. write target (force: the integrity slug in chat_metadata refers
-        // to the SOURCE file state and must not block a fresh target write)
+        // 3. write target. NOT forced: the copy carries its own integrity
+        // token (see adaptChatForTarget), and the server's integrity check
+        // passes freely for a file that does not exist yet — so leaving the
+        // check ON costs nothing and turns any collision we failed to predict
+        // into a rejected write instead of an overwritten chat.
         const saveRes = await fetch('/api/chats/save', {
             method: 'POST', headers: stHeaders(),
-            body: JSON.stringify({ avatar_url: target.avatar, file_name: destName, chat: adapted, force: true })
+            body: JSON.stringify({ avatar_url: target.avatar, file_name: destName, chat: adapted })
         });
         let saveOk = saveRes.ok;
         if (saveOk) {
@@ -879,6 +940,35 @@
         return changed;
     }
 
+    // v0.14.0 ROOT FIX (data integrity). ST has TWO delete paths and they are
+    // not equivalent:
+    //   * the UI path (.PastChat_cross -> handleDeleteChat -> delChat) calls
+    //     replaceCurrentChat() when the deleted file is the LOADED chat, i.e.
+    //     it clears the in-memory chat and loads a replacement;
+    //   * deleteCharacterChatByName() / deleteGroupChatByName() only repoint
+    //     the card's (or group's) chat pointer at some other existing file and
+    //     leave the deleted chat sitting in memory.
+    // TMC's bulk delete used the second kind for everything, so deleting the
+    // OPEN chat left ST holding a deleted chat whose chat_metadata.integrity
+    // belonged to the removed file while the save target had become a
+    // DIFFERENT, live chat. The next save then either tripped ST's integrity
+    // guard ("enter OVERWRITE to LOSE YOUR DATA", followed by a forced page
+    // reload) or — if that other chat predates integrity metadata, so the
+    // server skips the check — silently overwrote it with the deleted chat's
+    // messages. TMC already refused to move the open chat for exactly this
+    // class of reason; delete never got the same treatment.
+    // The fix keeps the fast path for every chat that is NOT open, and routes
+    // the open one through ST's own chat-aware teardown, last.
+    // Pure so the ordering can be proved in the suite.
+    function partitionOpenChat(fileNames, isOpenFn) {
+        const others = [];
+        const open = [];
+        for (const f of (Array.isArray(fileNames) ? fileNames : [])) {
+            (isOpenFn(f) ? open : others).push(f);
+        }
+        return { others, open };
+    }
+
     // v0.13.0: existence-based, not name-based — a folder literally named
     // "?" used to vanish from the Move-to menu.
     function buildFolderList(settings, characterId) {
@@ -913,26 +1003,78 @@
         return el.querySelector('.select_chat_block_filename, .select_chat_block_title, .avatar_title_div');
     }
 
+    // v0.14.0 ROOT FIX: the search box used to be located POSITIONALLY, with
+    // `input[type="search"], input[type="text"], .search_input` — the first
+    // match in document order. ST's popup header contains four other <input>
+    // elements BEFORE the search box (the hidden chat-import form). They only
+    // fail to match today because they carry no `type` attribute at all; the
+    // day one of them gains type="text", TMC binds its input listener to a
+    // hidden field and search dies silently. ST's search box has a stable id.
+    // One resolver, used by every consumer.
+    function findSearchInput(popup) {
+        return popup.querySelector('#select_chat_search')
+            || popup.querySelector('input[type="search"]')
+            || popup.querySelector('input.search_input')
+            || popup.querySelector('input[type="text"]')
+            || null;
+    }
+
+    // v0.14.0 ROOT FIX: which element actually SCROLLS the proxy list. This
+    // was previously guessed as `.shadow_select_chat_popup_body || popup` — a
+    // class that does not exist in any current ST build, so it always
+    // resolved to #shadow_select_chat_popup, which has no overflow and never
+    // scrolls. Two features were silently dead as a result: scroll
+    // preservation across rebuilds (scrollTop read 0, restore never ran, so
+    // every background resync snapped the list to the top) and the lazy-load
+    // observer's 300px prefetch margin (rootMargin expands the ROOT's rect,
+    // but the real clip came from #tmc_proxy_root further down, so batches
+    // only loaded once "Loading..." was already on screen).
+    // TMC's own stylesheet makes #tmc_proxy_root the scroller, so that is the
+    // answer; the ancestor walk is the fallback for a user stylesheet that
+    // moves the overflow somewhere else.
+    function getScrollContainer(popup, proxyRoot) {
+        const scrolls = (el) => {
+            if (!el) return false;
+            try {
+                const oy = getComputedStyle(el).overflowY;
+                return oy === 'auto' || oy === 'scroll' || oy === 'overlay';
+            } catch { return false; }
+        };
+        if (scrolls(proxyRoot)) return proxyRoot;
+        let node = proxyRoot && proxyRoot.parentElement;
+        while (node && node !== document.body) {
+            if (scrolls(node)) return node;
+            node = node.parentElement;
+        }
+        return proxyRoot || popup;
+    }
+
     // Find the ORIGINAL (native, non-proxy) block for a chat file.
     function findNativeBlock(fileName) {
         return document.querySelector(`.select_chat_block[file_name="${escAttr(fileName)}"]:not(.tmc_proxy_block)`);
     }
 
-    function formatDate(dateStr) {
-        if (!dateStr) return '';
-        try {
-            const date = new Date(dateStr);
-            const now = new Date();
-            const diff = now.getTime() - date.getTime();
-            const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-
-            if (days === 0) return 'Today';
-            if (days === 1) return 'Yesterday';
-            if (days < 7) return date.toLocaleDateString('en-US', { weekday: 'short' });
-            return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-        } catch {
-            return '';
+    // v0.14.0: resolve a chat's last-message time to a NUMBER, the only form
+    // anything downstream actually consumes (sort keys, the activity floor).
+    // Order: the native date cell, then the timestamp ST writes into its own
+    // default chat file names ("Name - 2026-07-30@12h34m56s" / plain ISO).
+    // Returns 0 when nothing parses — never NaN, which would poison
+    // Math.max() and make comparators return NaN.
+    function resolveBlockDate(cellText, fileName) {
+        const fromCell = cellText ? Date.parse(String(cellText)) : NaN;
+        if (Number.isFinite(fromCell)) return fromCell;
+        const id = String(fileName || '');
+        const st = id.match(/(\d{4}-\d{2}-\d{2})@(\d{1,2})h(\d{1,2})m(\d{1,2})s/);
+        if (st) {
+            const t = Date.parse(`${st[1]}T${st[2].padStart(2, '0')}:${st[3].padStart(2, '0')}:${st[4].padStart(2, '0')}`);
+            if (Number.isFinite(t)) return t;
         }
+        const iso = id.match(/\d{4}-\d{2}-\d{2}/);
+        if (iso) {
+            const t = Date.parse(iso[0]);
+            if (Number.isFinite(t)) return t;
+        }
+        return 0;
     }
 
     function extractChatTitle(fileName) {
@@ -941,11 +1083,58 @@
         return fileName.replace(/\.jsonl$/i, '').trim() || 'Untitled';
     }
 
-    function highlightText(text, term) {
-        if (!term || !text) return text;
-        const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const regex = new RegExp(`(${escapedTerm})`, 'gi');
-        return text.replace(regex, '<span style="background-color: rgba(255, 255, 0, 0.3); color: #fff; font-weight: bold;">$1</span>');
+    // v0.14.0 ROOT FIX: highlighting used to run a regex over ALREADY
+    // HTML-ESCAPED text and feed the result to innerHTML. Three defects fell
+    // out of that shape:
+    //   (1) searching "&" matched inside the entity "&amp;" and produced
+    //       "&<span>amp;</span>"; searching "<" never matched anything at all,
+    //       because the haystack held "&lt;";
+    //   (2) safety depended on escape-then-highlight ORDERING staying correct
+    //       at every call site forever — one site forgetting escapeHtml() was
+    //       an XSS (that is exactly the v0.7.0 title bug);
+    //   (3) the injected inline style hardcoded color:#fff, invisible on
+    //       light themes.
+    // Highlighting is now a DOM operation over PLAIN text. splitHighlight is
+    // pure (segments in, segments out) and applyHighlight builds text nodes
+    // plus <span class="tmc_hl"> elements. No HTML string is constructed
+    // anywhere on this path, so there is nothing left to escape and nothing
+    // left to order wrongly. Matching is literal (indexOf), so regex
+    // metacharacters in a search term are inert by construction.
+    function splitHighlight(text, term) {
+        const s = String(text === undefined || text === null ? '' : text);
+        const t = String(term === undefined || term === null ? '' : term);
+        if (!t || !s) return [{ text: s, hit: false }];
+        const hay = s.toLowerCase();
+        const needle = t.toLowerCase();
+        const parts = [];
+        let i = 0;
+        for (;;) {
+            const at = hay.indexOf(needle, i);
+            if (at === -1) break;
+            if (at > i) parts.push({ text: s.slice(i, at), hit: false });
+            parts.push({ text: s.slice(at, at + needle.length), hit: true });
+            i = at + needle.length;
+        }
+        if (i < s.length) parts.push({ text: s.slice(i), hit: false });
+        return parts.length ? parts : [{ text: s, hit: false }];
+    }
+
+    // Replaces el's contents with `text`, wrapping every case-insensitive
+    // occurrence of `term` in a highlight span. Never touches innerHTML.
+    function applyHighlight(el, text, term) {
+        if (!el) return;
+        el.textContent = '';
+        for (const part of splitHighlight(text, term)) {
+            if (!part.text) continue;
+            if (part.hit) {
+                const mark = document.createElement('span');
+                mark.className = 'tmc_hl';
+                mark.textContent = part.text;
+                el.appendChild(mark);
+            } else {
+                el.appendChild(document.createTextNode(part.text));
+            }
+        }
     }
 
     // ========== SEARCH CONTEXT PREVIEW ==========
@@ -1079,7 +1268,7 @@
             const snippet = buildContextSnippet(messages, searchTerm);
             if (!snippet) return; // no match in content - leave last-message preview as-is
 
-            previewEl.innerHTML = highlightText(escapeHtml(snippet), searchTerm);
+            applyHighlight(previewEl, snippet, searchTerm);
             previewEl.title = snippet; // full snippet on hover, in case it's truncated visually
             previewEl.classList.add('tmc_context_preview');
         });
@@ -1197,28 +1386,39 @@
         scheduleSync();
     }
 
+    // Single-chat move. One implementation only — moveChats does the work, so
+    // the one-chat and many-chats paths can never drift apart (they did: the
+    // bulk path used to loop this function, paying a settings write and a
+    // render schedule per chat).
     function moveChat(fileName, targetFolderId) {
+        moveChats([fileName], targetFolderId);
+    }
+
+    // v0.14.0: moving N chats used to call moveChat() N times — N
+    // saveSettings() calls and N scheduleSync() calls, each one resetting the
+    // other's debounce timer. Bulk paths go through here: one settings write,
+    // one render.
+    function moveChats(fileNames, targetFolderId) {
+        const list = Array.isArray(fileNames) ? fileNames : [fileNames];
         const settings = getSettings();
         const characterId = getCurrentCharacterId();
-        if (!characterId) return;
+        if (!characterId || !list.length) return;
 
-        const target = normalizeChatId(fileName);
+        const targets = new Set(list.map(normalizeChatId));
         const allFolderIds = settings.characterFolders[characterId] || [];
         for (const fid of allFolderIds) {
             const folder = settings.folders[fid];
-            if (folder && folder.chats) {
-                folder.chats = folder.chats.filter(c => normalizeChatId(c) !== target);
+            if (folder && Array.isArray(folder.chats)) {
+                folder.chats = folder.chats.filter(c => !targets.has(normalizeChatId(c)));
             }
         }
-
         if (targetFolderId && targetFolderId !== 'uncategorized') {
             const folder = settings.folders[targetFolderId];
             if (folder) {
-                if (!folder.chats) folder.chats = [];
-                folder.chats.push(normalizeChatId(fileName));
+                if (!Array.isArray(folder.chats)) folder.chats = [];
+                for (const id of targets) folder.chats.push(id);
             }
         }
-
         saveSettings();
         scheduleSync();
     }
@@ -1250,10 +1450,14 @@
             // Name
             const name = (fileName || '').toLowerCase();
 
-            // Date (Native)
+            // Date (Native). v0.14.0: the native date cell is rendered by
+            // moment's locale-dependent 'lll' format, so Date.parse() of it
+            // silently returns NaN on non-English ST installs — which used to
+            // make the "Last Msg" sort a no-op and drop the activity sort's
+            // floor to 0 for every chat. resolveBlockDate falls back to the
+            // timestamp ST bakes into its own default chat filenames.
             const dateEl = block.querySelector('.chat_messages_date');
-            const dateStr = dateEl ? dateEl.textContent : '';
-            const date = dateStr ? new Date(dateStr).getTime() : 0;
+            const date = resolveBlockDate(dateEl ? dateEl.textContent : '', fileName);
 
             // Message Count (123 💬)
             const msgEl = block.querySelector('.chat_messages_num');
@@ -1419,12 +1623,8 @@
         // needs its own way to keep loading more than the initial BATCH_SIZE.
         if ((currentView === 'folder' || folderId === 'uncategorized' || isFamily) && endIndex < chats.length) {
             const sentinel = document.createElement('div');
-            sentinel.className = 'tmc_sentinel';
-            sentinel.style.height = '20px';
-            sentinel.textContent = 'Loading...'; // Visual feedback
-            sentinel.style.opacity = '0.5';
-            sentinel.style.textAlign = 'center';
-            sentinel.style.fontSize = '12px';
+            sentinel.className = 'tmc_sentinel'; // sized/styled in style.css
+            sentinel.textContent = 'Loading…';
             sentinel.setAttribute('data-folder-id', folderId);
             sentinel.setAttribute('data-next-index', endIndex.toString());
             container.appendChild(sentinel);
@@ -1517,39 +1717,18 @@
                     return cached;
                 }
 
-                // Improved date extraction - try multiple sources
-                let dateStr = '';
-
-                // Method 1: Look for date element with specific classes
-                const dateEl = block.querySelector('.select_chat_block_date, .chat_date, [class*="date"]');
-                if (dateEl) {
-                    dateStr = dateEl.textContent || dateEl.title || '';
-                }
-
-                // Method 2: Look for elements containing date patterns (Jan XX, XXXX or similar)
-                if (!dateStr) {
-                    const allText = block.innerText || '';
-                    // Look for patterns like "Jan 18, 2026" or "January 18, 2026"
-                    const dateMatch = allText.match(/(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}/i);
-                    if (dateMatch) {
-                        dateStr = dateMatch[0];
-                    }
-                }
-
-                // Method 3: Check for ISO date in file_name or title
-                if (!dateStr && fileName) {
-                    const isoMatch = fileName.match(/\d{4}-\d{2}-\d{2}/);
-                    if (isoMatch) {
-                        dateStr = isoMatch[0];
-                    }
-                }
-
+                // v0.14.0: a three-method date-string extraction used to run
+                // here on every fresh block parse (i.e. on every search
+                // keystroke, per block) purely to fill `data.date` — a
+                // human-formatted string that NOTHING ever read. The only
+                // date anything consumes is the numeric one in
+                // `metadata.date`; its fallbacks now live in
+                // resolveBlockDate, where they are actually used.
                 const data = {
                     element: block,
                     signature: block.textContent,
                     fileName,
                     title: extractChatTitle(fileName),
-                    date: formatDate(dateStr),
                     html: block.innerHTML, // Full native content with buttons
                     metadata: getChatMetadata(block, fileName)
                 };
@@ -1560,8 +1739,8 @@
                 return data;
             }).filter(d => d.fileName);
 
-            // Capture Search Term
-            const searchBar = popup.querySelector('input[type="search"], input[type="text"], .search_input');
+            // Capture Search Term (one canonical resolver — see findSearchInput)
+            const searchBar = findSearchInput(popup);
             const searchTerm = searchBar instanceof HTMLInputElement ? searchBar.value.trim().toLowerCase() : '';
 
             // FIX: The proxy list previously never reacted to typing, because
@@ -1596,14 +1775,12 @@
             const visibleData = sortedData.filter(chat =>
                 !(chat.element && chat.element.style && chat.element.style.display === 'none'));
 
-            const body = popup.querySelector('.shadow_select_chat_popup_body') || popup;
-
             let proxyRoot = popup.querySelector('#tmc_proxy_root');
             if (!proxyRoot) {
                 proxyRoot = document.createElement('div');
                 proxyRoot.id = 'tmc_proxy_root';
 
-                const searchBarEl = popup.querySelector('input[type="search"], input[type="text"], .search_input');
+                const searchBarEl = findSearchInput(popup);
 
                 if (searchBarEl && searchBarEl.parentNode) {
                     const searchContainer = searchBarEl.closest('.shadow_select_chat_popup_header') || searchBarEl.parentNode;
@@ -1613,9 +1790,14 @@
                         searchContainer.parentNode.appendChild(proxyRoot);
                     }
                 } else {
-                    body.insertBefore(proxyRoot, body.firstChild);
+                    popup.insertBefore(proxyRoot, popup.firstChild);
                 }
             }
+
+            // The one true scroll container for the proxy list. Resolved AFTER
+            // proxyRoot exists, and used by BOTH consumers below (lazy-load
+            // observer root, scroll preservation) so they can never disagree.
+            const scroller = getScrollContainer(popup, proxyRoot);
 
             // CARDS BROWSER (v0.12.0): a cross-card surface; replaces the
             // per-card tree entirely while active.
@@ -1623,6 +1805,12 @@
                 refreshCardsData();
                 renderCardsTree(proxyRoot);
                 injectAddButton(popup);
+                // Cards mode returns early, so it must paint the header itself
+                // — this is the branch where the Cards toggle actually goes ON.
+                refreshHeaderState(popup);
+                // A different list entirely: don't hand its scroll offset back
+                // to the per-card tree when we leave.
+                lastListIdentity = 'cards';
                 return;
             }
 
@@ -1722,7 +1910,7 @@
             // Always (re)root the observer on the real scrolling container. Sentinels
             // are recreated every sync anyway, so this is cheap and keeps the root
             // correct even if the popup element instance changes.
-            initIntersectionObserver(body);
+            initIntersectionObserver(scroller);
 
             // Populate chatsByFolder memory store
             chatsByFolder = {};
@@ -1801,13 +1989,27 @@
                 renderBatch(fid, 0, initialBatchSize, container, searchTerm);
             });
 
-            // Preserve the list's scroll position across the rebuild.
-            lastScrollTop = body.scrollTop || 0;
+            // Preserve the list's scroll position across the rebuild — but
+            // only when the rebuild is showing the SAME list. Emptying
+            // proxyRoot collapses scrollHeight, which clamps scrollTop to 0,
+            // so the value has to be captured before and restored after.
+            // v0.14.0: `scroller` is the element that actually scrolls (this
+            // used to read #shadow_select_chat_popup, whose scrollTop is
+            // permanently 0 — so the restore never ran and every background
+            // resync threw the user back to the top of the list).
+            const listId = [
+                characterId, currentView, viewFolderId || '',
+                familyMode ? 'fam' : 'flat', searchTerm
+            ].join('\u0001');
+            const sameList = listId === lastListIdentity;
+            lastListIdentity = listId;
+            lastScrollTop = sameList ? (scroller.scrollTop || 0) : 0;
             proxyRoot.innerHTML = '';
             proxyRoot.appendChild(newTree);
-            if (lastScrollTop > 0) body.scrollTop = lastScrollTop;
+            scroller.scrollTop = lastScrollTop;
 
             injectAddButton(popup);
+            refreshHeaderState(popup);
 
         } catch (err) {
             console.error('[TMC] Sync Error:', err);
@@ -2052,8 +2254,7 @@
         if (isPinned) {
             const pinIcon = document.createElement('span');
             pinIcon.className = 'tmc_pin_icon';
-            pinIcon.innerHTML = '📌';
-            pinIcon.style.cssText = 'font-size: 12px; margin-right: 5px; opacity: 0.8;';
+            pinIcon.textContent = '📌';
 
             // Insert before title or at start
             const titleEl = getTitleEl(el);
@@ -2068,26 +2269,15 @@
         if (searchTerm) {
             const titleEl = getTitleEl(el);
             if (titleEl) {
-                const originalText = titleEl.textContent;
-                // Preserve the PIN icon if it's there (it's prepended)
-                // Actually prepending adds it to the DOM, modifying textContent usually wipes it.
-                // We should highlight safely.
-                // v0.7.0 XSS FIX: title must be escaped BEFORE being handed to
-                // highlightText, which injects it into innerHTML. The snippet
-                // path below already did this; the title path did not, so a
-                // chat file literally named <img src=x onerror=...>.jsonl
-                // would execute. Filenames with < > are legal on Linux.
-                const highlighted = highlightText(escapeHtml(chatData.title), searchTerm);
-
-                // If we replace innerHTML, we lose the pin. 
-                // Let's re-append highlight logic carefully.
-                // Simplest strategy: Set HTML, then re-add Pin.
-                titleEl.innerHTML = highlighted;
+                // v0.14.0: applyHighlight rebuilds the title as text nodes +
+                // highlight spans (see splitHighlight). It clears the element,
+                // which drops the pin icon prepended above — so the pin is
+                // re-prepended right after, exactly as before.
+                applyHighlight(titleEl, chatData.title, searchTerm);
                 if (isPinned) {
                     const pinIcon = document.createElement('span');
                     pinIcon.className = 'tmc_pin_icon';
-                    pinIcon.innerHTML = '📌';
-                    pinIcon.style.cssText = 'font-size: 12px; margin-right: 5px; opacity: 0.8;';
+                    pinIcon.textContent = '📌';
                     titleEl.prepend(pinIcon);
                 }
             }
@@ -2207,10 +2397,17 @@
                 else if (classList.contains('mes_edit')) selector = '.mes_edit';
                 else if (classList.contains('mes_export')) selector = '.mes_export';
 
-                // Fallback: Try strict class matching of the first class that isn't generic
-                if (!selector && target.className) {
-                    const parts = target.className.split(' ').filter(c => c !== 'mes_button' && c !== 'fa-solid' && c !== 'fa');
-                    if (parts.length > 0) selector = '.' + parts[0];
+                // Fallback: strict class matching on the first class that isn't
+                // generic. v0.14.0: read classList, not className. On an SVG
+                // element (FontAwesome's SVG-with-JS mode replaces every <i>
+                // with an <svg>) className is an SVGAnimatedString, not a
+                // string — truthy, so the old guard let it through, and
+                // .split() threw inside the click handler. Every proxy row
+                // button would have been silently dead on such a build.
+                if (!selector && target.classList && target.classList.length) {
+                    const parts = Array.from(target.classList)
+                        .filter(c => c !== 'mes_button' && c !== 'fa-solid' && c !== 'fa');
+                    if (parts.length > 0) selector = '.' + CSS.escape(parts[0]);
                 }
 
                 // v0.11.0: re-resolve the native block at CLICK time. ST rebuilds
@@ -2224,12 +2421,6 @@
                         originalBtn.click();
                         return;
                     }
-                }
-                // If explicit match failed, try the old fragile method as last resort
-                const clickedClass = target.className;
-                if (clickedClass) {
-                    const originalBtn = liveNative.querySelector('.' + clickedClass.split(' ')[0]);
-                    if (originalBtn) originalBtn.click();
                 }
                 return;
             }
@@ -2291,6 +2482,33 @@
         return el;
     }
 
+    // v0.14.0 ROOT FIX: the header buttons are created ONCE (ST keeps the
+    // popup markup alive between opens and just toggles display), so any
+    // toggle state painted at creation time drifts the moment that state
+    // changes anywhere else. Concretely: closing the popup resets cardsMode to
+    // false in syncPanelVisibility, but the Cards button kept its
+    // .tmc_toggle_on class — so it came back lit while showing the normal
+    // per-card tree, and the next tap then turned Cards ON while removing the
+    // highlight. Toggle state is no longer stored on the buttons: it is
+    // reconciled from the real state on every sync, in one place.
+    function refreshHeaderState(popup) {
+        const cardsBtn = popup.querySelector('.tmc_cards_btn');
+        if (cardsBtn) cardsBtn.classList.toggle('tmc_toggle_on', cardsMode);
+        const famBtn = popup.querySelector('.tmc_family_btn');
+        if (famBtn) {
+            let famOn = false;
+            try { famOn = !!getSettings().familyView; } catch { famOn = false; }
+            famBtn.classList.toggle('tmc_toggle_on', famOn);
+            // Families is a per-card organization of the current card's list;
+            // it means nothing in the cross-card Cards browser.
+            famBtn.classList.toggle('tmc_btn_muted', cardsMode);
+        }
+        const bulkBtn = popup.querySelector('.tmc_bulk_btn');
+        if (bulkBtn) bulkBtn.classList.toggle('tmc_toggle_on', bulkMode);
+        const sel = popup.querySelector('#tmc_sort_select');
+        if (sel && sel.value !== sortOrder) sel.value = sortOrder;
+    }
+
     function injectAddButton(popup) {
         if (popup.querySelector('.tmc_add_btn')) return;
 
@@ -2332,11 +2550,9 @@
         cardsBtn.className = 'menu_button tmc_add_btn tmc_cards_btn';
         cardsBtn.innerHTML = '<i class="fa-solid fa-address-book"></i> Cards';
         cardsBtn.title = 'Browse every character card\'s chats and jump between them';
-        if (cardsMode) cardsBtn.classList.add('tmc_toggle_on');
         cardsBtn.onclick = (e) => {
             e.stopPropagation();
             cardsMode = !cardsMode;
-            cardsBtn.classList.toggle('tmc_toggle_on', cardsMode);
             if (cardsMode) {
                 refreshCardsData(true);
                 // Bulk selection is a per-card surface; a floating bulk bar
@@ -2355,17 +2571,7 @@
         jumpBtn.title = 'Scroll to the currently open chat';
         jumpBtn.onclick = (e) => {
             e.stopPropagation();
-            const activeEl = popup.querySelector('.tmc_proxy_block.tmc_active');
-            if (activeEl) {
-                // Make sure no collapsed ancestor is hiding it for this jump.
-                const content = activeEl.closest('.tmc_content');
-                if (content && content.style.display === 'none') content.style.display = '';
-                activeEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
-                activeEl.classList.add('tmc_flash');
-                setTimeout(() => activeEl.classList.remove('tmc_flash'), 1200);
-            } else if (typeof toastr !== 'undefined') {
-                toastr.info('Open chat is not in the current view');
-            }
+            jumpToOpenChat(popup);
         };
 
         // FAMILIES TOGGLE (v0.10.0): alternate organization of the current
@@ -2375,14 +2581,12 @@
         famBtn.className = 'menu_button tmc_add_btn tmc_family_btn';
         famBtn.innerHTML = '<i class="fa-solid fa-code-branch"></i> Families';
         famBtn.title = 'Group this character\'s chats by branch lineage';
-        if (getSettings().familyView) famBtn.classList.add('tmc_toggle_on');
         famBtn.onclick = (e) => {
             e.stopPropagation();
             const s = getSettings();
             s.familyView = !s.familyView;
             saveSettings();
-            famBtn.classList.toggle('tmc_toggle_on', s.familyView);
-            scheduleSync();
+            scheduleSync(); // paints the toggle via refreshHeaderState
         };
 
         // SORT DROPDOWN
@@ -2436,6 +2640,68 @@
             headerRow.appendChild(bulkBtn);
             headerRow.appendChild(btn);
         }
+    }
+
+    // v0.14.0: the jump button used to give up with "Open chat is not in the
+    // current view" whenever the open chat was not currently RENDERED — which
+    // is the common case, not an edge case: main view truncates every manual
+    // folder to 3 rows, so the open chat sitting at position 7 of a folder was
+    // simply unreachable by the button whose entire job is reaching it.
+    // It now resolves where the chat lives and navigates there first, then
+    // scrolls once the render lands. Cards mode is a cross-card browser with
+    // no row for the open chat at all, so it steps out of it.
+    function jumpToOpenChat(popup) {
+        const flash = () => {
+            const el = popup.querySelector('.tmc_proxy_block.tmc_active');
+            if (!el) return false;
+            const content = el.closest('.tmc_content');
+            if (content && content.style.display === 'none') content.style.display = '';
+            el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            el.classList.add('tmc_flash');
+            setTimeout(() => el.classList.remove('tmc_flash'), 1200);
+            return true;
+        };
+        if (flash()) return;
+
+        const active = getActiveChatName();
+        if (!active) {
+            if (typeof toastr !== 'undefined') toastr.info('No chat is open right now');
+            return;
+        }
+        // Navigate to wherever it lives, then retry after the render.
+        let moved = false;
+        if (cardsMode) { cardsMode = false; moved = true; }
+        const settings = getSettings();
+        if (settings.familyView) {
+            // Family sections are never truncated, so the row exists once the
+            // holding section is expanded; clear its collapse flag.
+            const root = resolveFamilyRoot(active);
+            const key = familyCollapseKey(root);
+            if (settings.familyCollapsed && settings.familyCollapsed[key]) {
+                delete settings.familyCollapsed[key];
+                saveSettings();
+                moved = true;
+            }
+        } else {
+            const fid = getFolderForChat(active);
+            if (fid !== 'uncategorized' && !(currentView === 'folder' && viewFolderId === fid)) {
+                currentView = 'folder';
+                viewFolderId = fid;
+                moved = true;
+            } else if (fid === 'uncategorized' && currentView === 'folder') {
+                currentView = 'main';
+                viewFolderId = null;
+                moved = true;
+            }
+        }
+        if (!moved) {
+            if (typeof toastr !== 'undefined') toastr.info('Open chat is not in this list');
+            return;
+        }
+        // performSync is synchronous once scheduled; give the debounce room,
+        // then scroll to the row it just rendered.
+        performSync();
+        if (!flash()) requestAnimationFrame(() => flash());
     }
 
     function updateBulkBar() {
@@ -2496,40 +2762,74 @@
 
             let deletedCount = 0;
             let fallbackNeeded = false;
+            let skippedOpen = 0;
+
+            // The open chat is deleted LAST and through a chat-aware path, so
+            // ST is never left holding a file that no longer exists (see
+            // partitionOpenChat).
+            const { others, open } = partitionOpenChat(toDelete, isActiveChatFile);
+
+            const dropNativeRow = (fileName) => {
+                // The *ByName helpers bypass ST's own delete-button flow, so ST
+                // never removes this chat's entry from the already-rendered
+                // native popup list. Remove it ourselves, or the proxy tree
+                // keeps mirroring a deleted chat until the popup is reopened.
+                const originalBlock = findNativeBlock(fileName);
+                if (originalBlock) originalBlock.remove();
+            };
 
             try {
                 if (groupId) {
-                    const { deleteGroupChatByName } = await import('/scripts/group-chats.js');
-                    for (const fileName of toDelete) {
+                    const g = await import('/scripts/group-chats.js');
+                    for (const fileName of others) {
                         try {
-                            await deleteGroupChatByName(groupId, fileName.replace(/\.jsonl$/i, ''));
+                            await g.deleteGroupChatByName(groupId, normalizeChatId(fileName));
                             deletedCount++;
-                            const originalBlock = findNativeBlock(fileName);
-                            if (originalBlock) originalBlock.remove();
+                            dropNativeRow(fileName);
                         } catch (err) {
                             console.warn('[TMC] deleteGroupChatByName failed for:', fileName, err);
                         }
                     }
-                } else {
-                    // Import ST's own deleteCharacterChatByName — this uses getRequestHeaders() internally so CSRF tokens are handled correctly. fileName should not include .jsonl extension.
-                    const { deleteCharacterChatByName } = await import('/script.js');
-
-                    for (const fileName of toDelete) {
+                    for (const fileName of open) {
+                        // deleteGroupChat() clears chat metadata and jumps to a
+                        // real chat; deleteGroupChatByName() does neither.
+                        if (typeof g.deleteGroupChat !== 'function') { skippedOpen++; continue; }
                         try {
-                            // Strip .jsonl if present (ST function appends it internally)
-                            const cleanName = fileName.replace(/\.jsonl$/i, '');
-                            await deleteCharacterChatByName(characterId, cleanName);
+                            await g.deleteGroupChat(groupId, normalizeChatId(fileName));
                             deletedCount++;
+                            dropNativeRow(fileName);
+                        } catch (err) {
+                            console.warn('[TMC] deleteGroupChat (open chat) failed for:', fileName, err);
+                        }
+                    }
+                } else {
+                    // ST's own helpers use getRequestHeaders() internally, so CSRF
+                    // is handled for us. They take the name WITHOUT .jsonl.
+                    const s = await import('/script.js');
 
-                            // deleteCharacterChatByName bypasses ST's own delete-button click
-                            // flow, so ST never gets a chance to remove this chat's entry from
-                            // the already-rendered native popup list. Remove it ourselves so
-                            // the proxy tree doesn't keep mirroring a deleted chat until the
-                            // popup is closed and reopened.
-                            const originalBlock = findNativeBlock(fileName);
-                            if (originalBlock) originalBlock.remove();
+                    for (const fileName of others) {
+                        try {
+                            await s.deleteCharacterChatByName(characterId, normalizeChatId(fileName));
+                            deletedCount++;
+                            dropNativeRow(fileName);
                         } catch (err) {
                             console.warn('[TMC] deleteCharacterChatByName failed for:', fileName, err);
+                        }
+                    }
+                    for (const fileName of open) {
+                        // Same teardown ST's own delete button performs: remove
+                        // the file, then clear + reload into a real chat. Without
+                        // replaceCurrentChat available we do NOT delete it —
+                        // leaving the chat alive is always better than leaving ST
+                        // pointed at a deleted one.
+                        if (typeof s.replaceCurrentChat !== 'function') { skippedOpen++; continue; }
+                        try {
+                            await s.deleteCharacterChatByName(characterId, normalizeChatId(fileName));
+                            deletedCount++;
+                            dropNativeRow(fileName);
+                            await s.replaceCurrentChat();
+                        } catch (err) {
+                            console.warn('[TMC] open-chat delete failed for:', fileName, err);
                         }
                     }
                 }
@@ -2566,6 +2866,9 @@
             if (deletedCount > 0 && !fallbackNeeded) {
                 toastr.success(`Deleted ${deletedCount} chat${deletedCount !== 1 ? 's' : ''}`);
                 scheduleSync();
+            }
+            if (skippedOpen) {
+                toastr.warning(`Skipped ${skippedOpen} open chat — close or switch away from it first`);
             }
 
             clearSelection();
@@ -2648,7 +2951,7 @@
                 const newFid = n ? createFolder(n) : null;
                 if (newFid) {
                     const files = isBulk ? Array.from(selectedChats) : [fileName];
-                    files.forEach(f => moveChat(f, newFid));
+                    moveChats(files, newFid);
                     if (isBulk) clearSelection();
                     toastr.success(`Moved ${files.length} chat${files.length !== 1 ? 's' : ''} to ${folderLabel(newFid)}${familyHint}`);
                 }
@@ -2659,7 +2962,7 @@
 
             if (isBulk) {
                 const targetFid = item.dataset.fid;
-                selectedChats.forEach(file => moveChat(file, targetFid));
+                moveChats(Array.from(selectedChats), targetFid);
                 toastr.success(targetFid === 'uncategorized'
                     ? `Removed ${selectedChats.size} chat${selectedChats.size !== 1 ? 's' : ''} from folders`
                     : `Moved ${selectedChats.size} chat${selectedChats.size !== 1 ? 's' : ''} to ${folderLabel(targetFid)}${familyHint}`);
@@ -2855,7 +3158,7 @@
     // ========== INIT ==========
 
     function init() {
-        console.log(`[${EXTENSION_NAME}] v0.13.1 Loading...`);
+        console.log(`[${EXTENSION_NAME}] v0.14.0 Loading...`);
         const ctx = SillyTavern.getContext();
 
         // v0.11.0 one-time migration: normalize + dedupe stored folder chat
@@ -2947,6 +3250,35 @@
                     scheduleSync();
                 } catch (err) {
                     console.warn('[TMC] Rename migration failed:', err);
+                }
+            });
+        }
+
+        // v0.14.0: chats also disappear WITHOUT going through TMC — the native
+        // skull, /delchat, another extension. stripDeletedFromFolders is the
+        // one canonical cleanup for a chat leaving a card (folder membership,
+        // pin, activity stamp); until now it only ran on TMC's own bulk delete
+        // and move-to-card, so every other delete left orphaned bookkeeping
+        // behind. Worse than untidy: a folder still holding a dead name will
+        // silently swallow a future chat that happens to be renamed onto it.
+        // Both events carry the chat name (no extension); normalized anyway.
+        for (const evName of ['CHAT_DELETED', 'GROUP_CHAT_DELETED']) {
+            if (!ctx.event_types[evName]) continue;
+            ctx.eventSource.on(ctx.event_types[evName], (name) => {
+                try {
+                    const charKey = getCurrentCharacterId();
+                    const id = normalizeChatId(typeof name === 'string' ? name : (name && name.file_name));
+                    if (!charKey || !id) return;
+                    const settings = getSettings();
+                    if (stripDeletedFromFolders(settings, charKey, [id])) saveSettings();
+                    delete nativeDataCache[id];
+                    delete nativeDataCache[id + '.jsonl'];
+                    selectedChats.delete(id);
+                    selectedChats.delete(id + '.jsonl');
+                    activityData.fetchedAt = 0; // parentage may have changed
+                    scheduleSync();
+                } catch (err) {
+                    console.warn('[TMC] Post-delete cleanup failed:', err);
                 }
             });
         }
