@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Negative gate for v0.14.0.
+"""Negative gate for v0.14.0+v0.15.0.
 
 AGENTS.md rule: a guard that has never failed is unproven. For every fix in
 this release, reintroduce the ORIGINAL bug in a scratch tree and require that
@@ -140,6 +140,25 @@ CASES = [
      'applyHighlight(previewEl, snippet, searchTerm);',
      "previewEl.innerHTML = splitHighlight(snippet, searchTerm).map(p => p.hit ? '<span>' + p.text + '</span>' : p.text).join('');",
      'snippet preview is no longer built via innerHTML'),
+
+    # --- v0.15.0 ---
+    ('N13 double-open guard removed', 'index.js',
+     """            const openTarget = findNativeBlock(chatData.fileName) || chatData.element;
+            if (openTarget && openTarget.isConnected) {
+                e.stopPropagation();
+                openTarget.click();
+            } else if (openTarget) {
+                openTarget.click();
+            }""",
+     """            (findNativeBlock(chatData.fileName) || chatData.element).click();""",
+     'unconditional forward-and-bubble is gone'),
+
+    ('N14 beginning preview not wired', 'index.js',
+     """        if (!searchTerm && ((chatData.metadata && chatData.metadata.size) || 0) <= ENRICH_MAX_BYTES) {
+            enrichPreviewWithBeginning(el, chatData.fileName, getTitleEl(el));
+        }""",
+     '',
+     'beginning enrichment wired outside search with the shared size guard'),
 ]
 
 
@@ -178,7 +197,7 @@ def run_case(label, fname, fixed, buggy, expect):
 
 
 ok = 0
-print('NEGATIVE GATE — reintroducing each v0.14.0 bug\n')
+print('NEGATIVE GATE — reintroducing each v0.14.0+v0.15.0 bug\n')
 for c in CASES:
     if run_case(*c):
         ok += 1

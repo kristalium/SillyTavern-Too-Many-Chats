@@ -3,7 +3,7 @@
 <div align="center">
 
 ![SillyTavern Extension](https://img.shields.io/badge/SillyTavern-Extension-orange?style=for-the-badge)
-![Version](https://img.shields.io/badge/version-0.14.0-blue?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-0.15.0-blue?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
 
 **Organize, search, and actually find your SillyTavern chats**
@@ -70,6 +70,30 @@ The suite includes a stamp-drift gate: `manifest.json` version must equal both
 in-code version stamps.
 
 ## 📜 Changelog
+
+- **0.15.0** — Root fixes against live ST source (server endpoints +
+  bookmarks.js):
+  - **Chat rows showed the wrong end of the last message.** ST's
+    `/api/chats/search` builds each row's preview as the *tail* of the last
+    message (server-side `getPreviewMessage`: "…" + the final 400 chars), and
+    TMC's proxy rows inherited it — every chat was identified by the random
+    end of the last output, while ST's own Recent Chats panel leads with the
+    message's *beginning*. Rows now show the beginning of the last message,
+    fetched lazily (shared 4 MB size guard, cached, fail-soft: oversized or
+    unreadable chats keep the native preview), applied synchronously on
+    re-renders so it never flashes back to the tail, and invalidated whenever
+    a message lands so it can't go stale. During an active search the
+    contextual match snippet still wins.
+  - **Opening a chat fired everything twice** — two "Chat History — Loading
+    chat…" banners and two full chat loads per click. Current ST opens chat
+    rows through a document-delegated handler (bookmarks.js) matching
+    `.select_chat_block[file_name]` — both of which TMC's proxy rows carry.
+    The forwarded click on the parked native block bubbled to document and
+    fired the handler once; the proxy's own click then bubbled there too and
+    fired it *again*. The forwarded native click is now the single open path;
+    when no live native block exists (ST rebuilt the list mid-render) the
+    click still opens exactly once per build — direct-bound handlers on older
+    ST, the delegated one on current ST.
 
 - **0.14.0** — Second audit against live SillyTavern source, this time
   including the server endpoints. Root fixes:

@@ -1121,5 +1121,114 @@ console.log('[59] v0.14.0: CSS contract — every class the JS applies is styled
     assert(css.includes(`Styles v${manifest.version} `), `stylesheet stamp matches manifest (${manifest.version})`);
 }
 
+
+console.log('[60] v0.15.0: buildBeginningPreview — beginning of the last output, not the tail');
+{
+    const buildBeginningPreview = new Function(extract('buildBeginningPreview') + '\nreturn buildBeginningPreview;')();
+    const long = 'Start of a very long message. ' + 'x'.repeat(500);
+    assert(buildBeginningPreview(['one', 'two', long]) === long.slice(0, 400),
+        'long last message yields its FIRST 400 chars (server preview was its LAST 400)');
+    assert(buildBeginningPreview(['older turn', '  Line one.\n\nLine   two.  ']) === 'Line one. Line two.',
+        'whitespace/newlines collapsed into one visual line');
+    assert(buildBeginningPreview(['short message']) === 'short message', 'short message passes through whole');
+    assert(buildBeginningPreview([]) === null, 'no messages -> null (caller keeps native preview)');
+    assert(buildBeginningPreview(null) === null, 'non-array -> null');
+    assert(buildBeginningPreview(['   ']) === null, 'blank last message -> null');
+    assert(buildBeginningPreview(['a', 'b'], 5) === 'b', 'maxChars respected');
+}
+
+console.log('[61] v0.15.0: enrichPreviewWithBeginning — fetch once, apply beginning, cache');
+await (async () => {
+    const findPreviewElement = new Function(extract('findPreviewElement') + '\nreturn findPreviewElement;')();
+    const buildBeginningPreview = new Function(extract('buildBeginningPreview') + '\nreturn buildBeginningPreview;')();
+    const ewbSrc = extract('enrichPreviewWithBeginning');
+    const messages = ['first turn', 'second turn', 'The tavern door creaks open and she looks up.'];
+    const beginningCache = {};
+    let fetchCalls = 0;
+
+    const mkBlock = () => {
+        const el = document.createElement('div');
+        el.innerHTML = '<div class="select_chat_block_filename">Chat 1</div><div class="select_chat_block_mes">\u2026tail of the last message</div>';
+        document.body.appendChild(el); // isConnected === true
+        return el;
+    };
+    const mkEnrich = (msgs) => new Function('fetchChatMessages', 'contentCacheKey', 'findPreviewElement', 'buildBeginningPreview', 'beginningPreviewCache',
+        ewbSrc + '\nreturn enrichPreviewWithBeginning;')(
+        async () => { fetchCalls++; return msgs; },
+        (f) => 'C::' + f,
+        findPreviewElement,
+        buildBeginningPreview,
+        beginningCache);
+    const ewb = mkEnrich(messages);
+
+    // A. cache miss -> one fetch -> beginning applied asynchronously
+    const el1 = mkBlock();
+    ewb(el1, 'Chat 1', null);
+    assert(fetchCalls === 1, 'cache miss fetches once');
+    await new Promise(r => setTimeout(r, 0));
+    assert(el1.querySelector('.select_chat_block_mes').textContent === messages[2],
+        'tail preview replaced with the BEGINNING of the last message');
+    assert(beginningCache['C::Chat 1'] === messages[2], 'beginning stored in the cache');
+
+    // B. cache hit -> synchronous apply, no refetch (no tail flash on re-render)
+    const el2 = mkBlock();
+    ewb(el2, 'Chat 1', null);
+    assert(fetchCalls === 1, 'cache hit does not refetch');
+    assert(el2.querySelector('.select_chat_block_mes').textContent === messages[2],
+        'cache hit applies synchronously');
+
+    // C. a block detached mid-flight (re-rendered) is never written
+    const el3 = document.createElement('div');
+    el3.innerHTML = '<div class="select_chat_block_mes">\u2026tail</div>';
+    ewb(el3, 'Detached Chat', null);
+    await new Promise(r => setTimeout(r, 0));
+    assert(fetchCalls === 2, 'detached case still fetched (result is cached for the live block)');
+    assert(el3.querySelector('.select_chat_block_mes').textContent === '\u2026tail',
+        'detached block keeps its text');
+    assert(beginningCache['C::Detached Chat'] === messages[2], 'its result still landed in the cache');
+
+    // D. empty chat -> native preview kept, and never retried per sync
+    const ewbEmpty = mkEnrich([]);
+    const el4 = mkBlock();
+    ewbEmpty(el4, 'Empty Chat', null);
+    await new Promise(r => setTimeout(r, 0));
+    assert(el4.querySelector('.select_chat_block_mes').textContent === '\u2026tail of the last message',
+        'empty chat keeps the native preview');
+    ewbEmpty(el4, 'Empty Chat', null);
+    assert(fetchCalls === 3, 'known-empty is not refetched on every sync');
+})();
+
+console.log('[62] v0.15.0: beginning preview wired outside search; single-open click path');
+{
+    const cpb = stripComments(extract('createProxyBlock'));
+    assert(/!searchTerm && \(\(chatData\.metadata && chatData\.metadata\.size\) \|\| 0\) <= ENRICH_MAX_BYTES\)\s*\{\s*enrichPreviewWithBeginning\(el, chatData\.fileName, getTitleEl\(el\)\)/.test(cpb),
+        'beginning enrichment wired outside search with the shared size guard');
+    assert((cpb.match(/const ENRICH_MAX_BYTES = 4 \* 1024 \* 1024;/g) || []).length === 1,
+        'size budget hoisted and declared exactly once');
+
+    assert(/e\.stopPropagation\(\);\s*openTarget\.click\(\)/.test(cpb),
+        'forwarded open is the single open path (proxy click stopped from reaching the delegated opener)');
+    assert(!cpb.includes('(findNativeBlock(chatData.fileName) || chatData.element).click();'),
+        'unconditional forward-and-bubble is gone');
+    assert(cpb.includes('openTarget.isConnected'),
+        'only a live native block suppresses the bubble (stale block still opens via delegation)');
+}
+
+console.log('[63] v0.15.0: message events invalidate preview/content caches');
+{
+    const initSrc = stripComments(extract('init'));
+    assert(/ctx\.eventSource\.on\(ctx\.event_types\[evName\], \(\) => \{[^}]*invalidateChatContentCaches\(\)/.test(initSrc),
+        'message-event handler invalidates the caches');
+    assert(!initSrc.includes('eventSource.on(ctx.event_types[evName], stampActivity)'),
+        'bare stampActivity subscription replaced');
+
+    const cc = { 'C::a': ['x'] }, order = ['C::a'], bc = { 'C::a': 'y' };
+    const inv = new Function('chatContentCache', 'contentCacheOrder', 'beginningPreviewCache',
+        extract('invalidateChatContentCaches') + '\nreturn invalidateChatContentCaches;')(cc, order, bc);
+    inv();
+    assert(Object.keys(cc).length === 0 && order.length === 0 && Object.keys(bc).length === 0,
+        'invalidation empties content cache, LRU order, and beginning cache');
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

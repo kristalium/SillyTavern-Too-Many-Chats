@@ -1,12 +1,12 @@
 /**
  * Too Many Chats - SillyTavern Extension
  * Chat organization and stuff
- * v0.14.0 - Audit vs live ST source: open-chat-safe bulk delete (ST's own
- *           deleteCharacterChatByName/deleteGroupChatByName leave the deleted
- *           chat loaded in memory), one canonical scroll container (scroll
- *           preservation + lazy-load prefetch were rooted on a non-scrolling
- *           element), header toggles reconciled from state, collision-safe
- *           move-to-card, DOM-based highlighting, external-delete cleanup
+ * v0.15.0 - Chat rows now lead with the BEGINNING of the last message (ST's
+ *           /api/chats/search preview is the message TAIL — '…' + final 400
+ *           chars — which is what every row used to show), and a chat opened
+ *           from the list loads exactly once (the forwarded native click and
+ *           the proxy's own bubble both reached ST's document-delegated
+ *           opener: double "Chat History — Loading chat…" banner, double load)
  * @original author - chaaruze
  * @picked up by - Kristalium
  */
@@ -99,6 +99,13 @@
             delete chatContentCache[evicted];
         }
     }
+
+    // v0.15.0: beginnings of last messages, keyed like the content cache.
+    // Stored separately so re-renders apply the beginning SYNCHRONOUSLY —
+    // deriving it through the (async) fetch cache on every render would flash
+    // the native tail text on each sync. '' marks known-empty/failed, so a
+    // chat with no usable text is not refetched on every sync either.
+    let beginningPreviewCache = {};
     // Cache of parsed native chat-block data (dates, sizes, html, etc.), keyed
     // by fileName -> { element, ... }. Avoids re-parsing every native block
     // (regex date/size extraction, full innerHTML copy) on every sync, which
@@ -1274,6 +1281,58 @@
         });
     }
 
+    // ========== LAST-MESSAGE BEGINNING PREVIEW ==========
+
+    // Pure: the beginning of the LAST message — the text ST's own Recent
+    // Chats panel leads with. Whitespace-collapsed into a single visual line
+    // (the native 3-line CSS clamp does the visible truncation; raw newlines
+    // would eat that budget). null when there is nothing usable, so callers
+    // keep the native preview as the fallback.
+    function buildBeginningPreview(messages, maxChars = 400) {
+        if (!Array.isArray(messages) || messages.length === 0) return null;
+        const last = messages[messages.length - 1];
+        if (typeof last !== 'string' || !last.trim()) return null;
+        const flat = last.replace(/\s+/g, ' ').trim();
+        return flat.length > maxChars ? flat.slice(0, maxChars) : flat;
+    }
+
+    // Kicks off (async) replacement of a block's tail preview with the
+    // BEGINNING of the last message. Same contract as
+    // enrichPreviewWithContext: the native preview stays until/unless the
+    // fetch yields text, and a detached block is never written to.
+    function enrichPreviewWithBeginning(el, fileName, titleEl) {
+        const previewEl = findPreviewElement(el, titleEl);
+        if (!previewEl) return;
+
+        const key = contentCacheKey(fileName);
+        const cached = beginningPreviewCache[key];
+        if (cached) { // known beginning — apply synchronously, no fetch
+            previewEl.textContent = cached;
+            previewEl.title = cached;
+            return;
+        }
+        if (cached === '') return; // known empty/failed — keep native preview
+
+        fetchChatMessages(fileName).then(messages => {
+            const beginning = buildBeginningPreview(messages);
+            beginningPreviewCache[key] = beginning || '';
+            if (!beginning || !el.isConnected) return; // keep native preview
+            previewEl.textContent = beginning;
+            previewEl.title = beginning;
+        });
+    }
+
+    // The last message of the open chat changes with every turn, so a cached
+    // beginning (or search-context message list) built from the old content
+    // is stale the moment a message lands. Both caches are small and
+    // fail-soft; wholesale invalidation on message events is the one rule
+    // that can never serve a stale preview.
+    function invalidateChatContentCaches() {
+        for (const k of Object.keys(chatContentCache)) delete chatContentCache[k];
+        contentCacheOrder.length = 0;
+        for (const k of Object.keys(beginningPreviewCache)) delete beginningPreviewCache[k];
+    }
+
 
     function createFolder(name) {
         if (!name || !name.trim()) return null;
@@ -2240,6 +2299,11 @@
     function createProxyBlock(chatData, isPinned, searchTerm = '') {
         const el = document.createElement('div');
         el.className = 'select_chat_block tmc_proxy_block';
+
+        // Shared preview-fetch budget (v0.11.0): don't download very large
+        // chats just for a preview snippet — the native preview stays. 4MB is
+        // already a serious JSON.parse on a phone's main thread.
+        const ENRICH_MAX_BYTES = 4 * 1024 * 1024;
         if (isPinned) el.classList.add('tmc_pinned');
 
         // Use full native HTML content (includes preview, buttons, etc.)
@@ -2285,13 +2349,21 @@
             // CONTEXTUAL PREVIEW: replace the (always-last-message) preview
             // text with a snippet of context around where the search term
             // actually appears in the chat, instead of the last message.
-            // v0.11.0: don't download very large chats just for a preview
-            // snippet — the native last-message preview stays. 4MB is already
-            // a serious JSON.parse on a phone's main thread.
-            const ENRICH_MAX_BYTES = 4 * 1024 * 1024;
             if (((chatData.metadata && chatData.metadata.size) || 0) <= ENRICH_MAX_BYTES) {
                 enrichPreviewWithContext(el, chatData.fileName, searchTerm, titleEl);
             }
+        }
+
+        // BEGINNING PREVIEW (v0.15.0 ROOT FIX): ST's /api/chats/search builds
+        // each row's preview as the TAIL of the last message (server-side
+        // getPreviewMessage: '…' + the final 400 chars), so every row was
+        // identified by the random END of the last output. ST's own Recent
+        // Chats panel leads with the message's BEGINNING — restore that here.
+        // While a search term is active the contextual match snippet is the
+        // more useful text, so it wins; oversized chats keep the native
+        // preview rather than being downloaded for cosmetics.
+        if (!searchTerm && ((chatData.metadata && chatData.metadata.size) || 0) <= ENRICH_MAX_BYTES) {
+            enrichPreviewWithBeginning(el, chatData.fileName, getTitleEl(el));
         }
 
         // BRANCH CHIP (v0.8.0): parentage comes from chat_metadata.main_chat
@@ -2469,7 +2541,28 @@
             }
 
             // Otherwise load the chat (re-resolved: see liveNative note above)
-            (findNativeBlock(chatData.fileName) || chatData.element).click();
+            //
+            // v0.15.0 ROOT FIX (double "Chat History — Loading chat…" banner):
+            // current ST opens chat rows through a DOCUMENT-delegated handler
+            // (bookmarks.js) matching '.select_chat_block[file_name]' — both
+            // of which this proxy carries. The forwarded native click bubbles
+            // to document and fires that handler once; WITHOUT
+            // stopPropagation the proxy's own click then bubbles there too
+            // and fires it AGAIN — two loader banners and two full chat loads
+            // per click. So when a live native block exists it is the ONE open
+            // path and this event goes no further. When the native block went
+            // stale (ST rebuilds the list per search keystroke) there is
+            // nothing live to forward to: a click on the detached node still
+            // reaches handlers bound DIRECTLY to it (older ST), while the
+            // un-stopped bubble reaches the delegated one (current ST) —
+            // each build gets exactly one open.
+            const openTarget = findNativeBlock(chatData.fileName) || chatData.element;
+            if (openTarget && openTarget.isConnected) {
+                e.stopPropagation();
+                openTarget.click();
+            } else if (openTarget) {
+                openTarget.click();
+            }
         });
 
 
@@ -3158,7 +3251,7 @@
     // ========== INIT ==========
 
     function init() {
-        console.log(`[${EXTENSION_NAME}] v0.14.0 Loading...`);
+        console.log(`[${EXTENSION_NAME}] v0.15.0 Loading...`);
         const ctx = SillyTavern.getContext();
 
         // v0.11.0 one-time migration: normalize + dedupe stored folder chat
@@ -3209,7 +3302,12 @@
         // this build exposes.
         for (const evName of ['MESSAGE_SENT', 'MESSAGE_RECEIVED', 'MESSAGE_EDITED', 'MESSAGE_SWIPED', 'MESSAGE_DELETED']) {
             if (ctx.event_types[evName]) {
-                ctx.eventSource.on(ctx.event_types[evName], stampActivity);
+                ctx.eventSource.on(ctx.event_types[evName], () => {
+                    stampActivity();
+                    // v0.15.0: a turn just changed the open chat's last
+                    // message — cached beginnings / search content are stale.
+                    invalidateChatContentCaches();
+                });
             }
         }
 
