@@ -3,7 +3,7 @@
 <div align="center">
 
 ![SillyTavern Extension](https://img.shields.io/badge/SillyTavern-Extension-orange?style=for-the-badge)
-![Version](https://img.shields.io/badge/version-0.15.0-blue?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-0.16.0-blue?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
 
 **Organize, search, and actually find your SillyTavern chats**
@@ -43,7 +43,7 @@
 ## 📦 Installation
 
 1. Open SillyTavern → **Extensions** → **Install Extension**
-2. Paste: `https://github.com/brucestarkallen/SillyTavern-Too-Many-Chats`
+2. Paste: `https://github.com/kristalium/SillyTavern-Too-Many-Chats`
 3. Click **Install** and refresh
 
 ## 🚀 Usage
@@ -53,23 +53,42 @@
 - **Crosshair** button — scroll back to the chat you have open
 - Folder headers collapse on click; hover for rename / color / delete
 
-## 🧪 Development
-
-Gate (run before every push; both must pass):
-
-```bash
-cp index.js /tmp/tmc_gate.mjs && node --check /tmp/tmc_gate.mjs   # ESM parse via .mjs copy
-node test_tmc.mjs                                                  # full suite, exit 1 on any failure
-python3 negtest.py                                                 # negative gate: every guard proven to fire
-```
-
-`test_tmc.mjs` extracts top-level functions from the real `index.js` by brace
-counting and runs them in a jsdom sandbox — new top-level functions must be
-added to the relevant extraction lists or their sandboxed callers will throw.
-The suite includes a stamp-drift gate: `manifest.json` version must equal both
-in-code version stamps.
-
 ## 📜 Changelog
+
+- **0.16.0** — Fail-safe + robustness pass:
+  - **Bulk delete could fail completely and silently.** Every per-chat error
+    was swallowed with only a console warning; if the delete helpers errored
+    systematically, `deletedCount` stayed 0 and *no toast fired at all* —
+    the user confirmed a destructive action and nothing visibly happened.
+    Zero deleted (outside the fallback path) is now an explicit error toast.
+    The native-button fallback also no longer counts every click as a
+    deletion — ST's own confirm dialog decides, so a cancelled confirmation
+    is no longer reported as deleted.
+  - **Search could re-download ~6 full chats per keystroke, forever.** The
+    content cache (24 entries) was *smaller* than the search-mode render
+    slab (30 rows), so rendering 30 rows through a 24-slot LRU evicted the
+    first 6 keys mid-pass and the next keystroke re-fetched them in full
+    (up to 4 MB each). The cache is now 48 — always ≥ the slab.
+  - **Stale previews could survive a cache invalidation.** A fetch in flight
+    when a message landed wrote its (now stale) pre-turn content back into
+    the cache *after* the invalidation cleared it, and nothing invalidated
+    again until the next message event. Fetches now capture a cache
+    generation at start; if the generation moved on, the result is served
+    to the current render but never cached. Relatedly, a *failed* fetch used
+    to be cached forever (as "known empty"), so one network hiccup killed
+    that chat's previews for the whole session — failures now resolve to
+    `null` (never cached as "known") and are retried after a 30 s window.
+  - **A dead extension left the user with no chat list at all.** The
+    stylesheet unconditionally parked SillyTavern's native chat list
+    off-screen; if TMC's JS failed to load or errored before the first
+    render, the popup was empty with nothing behind it. The hiding rules are
+    now gated behind `body.tmc-live`, a class the JS adds only on render
+    paths that actually completed — a broken extension leaves the native
+    list fully visible and usable.
+  - Dev: `.gitattributes` forces LF in the working tree on every platform —
+    the test suite's comment strippers and brace-counting extractor silently
+    misfire on CRLF checkouts (JS `.` doesn't match `\r`), which made 5
+    guards spuriously fail on Windows.
 
 - **0.15.0** — Root fixes against live ST source (server endpoints +
   bookmarks.js):
@@ -186,8 +205,23 @@ in-code version stamps.
 - **0.7.0** — Observer split (mutation vs intersection), active-chat marker,
   title XSS fix.
 
+## 🧪 Development
+
+Gate (run before every push; both must pass):
+
+```bash
+cp index.js /tmp/tmc_gate.mjs && node --check /tmp/tmc_gate.mjs   # ESM parse via .mjs copy
+node test_tmc.mjs                                                  # full suite, exit 1 on any failure
+python3 negtest.py                                                 # negative gate: every guard proven to fire
+```
+
+`test_tmc.mjs` extracts top-level functions from the real `index.js` by brace
+counting and runs them in a jsdom sandbox — new top-level functions must be
+added to the relevant extraction lists or their sandboxed callers will throw.
+The suite includes a stamp-drift gate: `manifest.json` version must equal both
+in-code version stamps.
+
 ## 📄 License
 
 [MIT](LICENSE) — original author [chaaruze](https://github.com/chaaruze),
-continued by Kristalium, this fork maintained by
-[brucestarkallen](https://github.com/brucestarkallen).
+continued by me and [brucestarkallen](https://github.com/brucestarkallen) and everyone else

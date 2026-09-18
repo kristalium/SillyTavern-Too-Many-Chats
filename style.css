@@ -1,5 +1,5 @@
 /**
- * Too Many Chats - Styles v0.15.0 (aligned with extension version)
+ * Too Many Chats - Styles v0.16.0
  * ChatGPT-inspired clean layout with SillyTavern theme integration
  */
 
@@ -12,10 +12,16 @@
    1. Give it full viewport size so virtualization renders ALL items (or enough of them).
    2. Position it absolutely FAR off-screen so it doesn't affect layout.
    3. Opacity 0 and pointer-events none to be safe.
+
+   v0.16.0 FAIL-SAFE: these rules are gated behind body.tmc-live, which the JS
+   adds ONLY after a proxy render has actually completed (see performSync). If
+   the extension's JS fails to load or errors out first, the class never lands,
+   these rules stay inert, and the user keeps a working native chat list
+   instead of an empty popup with no chat list at all.
 */
-#select_chat_popup .select_chat_block_wrapper,
-#shadow_select_chat_popup .select_chat_block_wrapper,
-#select_chat_div {
+body.tmc-live #select_chat_popup .select_chat_block_wrapper,
+body.tmc-live #shadow_select_chat_popup .select_chat_block_wrapper,
+body.tmc-live #select_chat_div {
     position: absolute !important;
     top: -9999px !important;
     /* Move far off-screen */

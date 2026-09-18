@@ -1,0 +1,11 @@
+# v0.16.0: the test suite's comment strippers and brace-counting extractor
+# assume LF files; CRLF checkouts silently defeat them (JS `.` does not match
+# \r, so `/\/\/.*$/` fails to strip comments and static asserts misfire).
+# Force LF in the working tree on every platform.
+* text=auto
+*.js  text eol=lf
+*.mjs text eol=lf
+*.css text eol=lf
+*.py  text eol=lf
+*.json text eol=lf
+*.md  text eol=lf

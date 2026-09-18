@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Negative gate for v0.14.0+v0.15.0.
+"""Negative gate for v0.14.0+v0.15.0+v0.16.0.
 
 AGENTS.md rule: a guard that has never failed is unproven. For every fix in
 this release, reintroduce the ORIGINAL bug in a scratch tree and require that
@@ -11,8 +11,16 @@ restore the COMMITTED file, not the working state under test.
 """
 import io, os, shutil, subprocess, sys
 
+# /tmp is the POSIX convention. On Windows the suite's jsdom/jquery resolve
+# through the PARENT chain (SillyTavern's node_modules — the extension's own
+# is untracked and often absent), so a scratch tree in %TEMP% loses that
+# chain and every case crashes with ERR_MODULE_NOT_FOUND. Keep the scratch
+# INSIDE the extension dir there; gitignored as tmc_neg_scratch/.
 SRC = os.path.dirname(os.path.abspath(__file__))
-SCRATCH = '/tmp/tmc_neg'
+if os.name == 'nt':
+    SCRATCH = os.path.join(SRC, 'tmc_neg_scratch')
+else:
+    SCRATCH = '/tmp/tmc_neg'
 
 # (label, file, original-buggy-text, current-fixed-text, expected failing assertion substring)
 CASES = [
@@ -124,12 +132,12 @@ CASES = [
      'bulk path no longer loops moveChat'),
 
     ('N10b cards branch stops painting the header', 'index.js',
-     """                refreshHeaderState(popup);
+     """                document.body.classList.add('tmc-live');
                 // A different list entirely: don't hand its scroll offset back
                 // to the per-card tree when we leave.
                 lastListIdentity = 'cards';""",
      """                lastListIdentity = 'cards';""",
-     'reconciliation runs on every sync path, including the cards-mode early return'),
+     'cards early return gates the CSS before handing off list identity'),
 
     ('N11 external-delete cleanup removed', 'index.js',
      "for (const evName of ['CHAT_DELETED', 'GROUP_CHAT_DELETED']) {",
@@ -159,6 +167,61 @@ CASES = [
         }""",
      '',
      'beginning enrichment wired outside search with the shared size guard'),
+
+    # --- v0.16.0 ---
+    ('N15 bulk delete silent total failure returns', 'index.js',
+     """            if (deletedCount === 0 && !fallbackNeeded && toDelete.length > 0) {
+                toastr.error(`Could not delete any of the ${toDelete.length} selected chat${toDelete.length !== 1 ? 's' : ''} — see browser console (F12) for details`);
+            }""",
+     '',
+     'zero-deleted bulk delete raises an explicit error toast'),
+
+    ('N16 fallback counts unconfirmed clicks again', 'index.js',
+     """                        delBtn.click();
+                        await new Promise(r => setTimeout(r, 80));""",
+     """                        delBtn.click();
+                        deletedCount++;
+                        await new Promise(r => setTimeout(r, 80));""",
+     'native-click fallback no longer counts unconfirmed clicks as deleted'),
+
+    ('N17 content cache shrunk below the search slab', 'index.js',
+     'const CONTENT_CACHE_MAX = 48;',
+     'const CONTENT_CACHE_MAX = 24;',
+     'no guaranteed LRU thrash'),
+
+    ('N18 stale-generation write-back re-enabled', 'index.js',
+     'const gen = contentCacheGeneration;',
+     'const gen = 0;',
+     'fetch captures the cache generation at start'),
+
+    ('N19 invalidation stops bumping the generation', 'index.js',
+     'contentCacheGeneration++;',
+     '// contentCacheGeneration++;',
+     'generation bumped'),
+
+    ('N20 failed fetch cached as known-empty again', 'index.js',
+     "            if (messages === null) return; // transient failure — keep native preview, retry next render",
+     '',
+     'a failed fetch never poisons the beginning-preview cache'),
+
+    ('N21 native-list hiding ungated again', 'style.css',
+     """body.tmc-live #select_chat_popup .select_chat_block_wrapper,
+body.tmc-live #shadow_select_chat_popup .select_chat_block_wrapper,
+body.tmc-live #select_chat_div {""",
+     """#select_chat_popup .select_chat_block_wrapper,
+#shadow_select_chat_popup .select_chat_block_wrapper,
+#select_chat_div {""",
+     'native-list hiding rule is scoped under body.tmc-live'),
+
+    ('N22 render-success gate removed (main tail)', 'index.js',
+     """            injectAddButton(popup);
+            refreshHeaderState(popup);
+            // v0.16.0 FAIL-SAFE — see the cards-mode branch above: the native
+            // list is only hidden once this render has actually succeeded.
+            document.body.classList.add('tmc-live');""",
+     """            injectAddButton(popup);
+            refreshHeaderState(popup);""",
+     'main render tail gates the CSS right before the sync catch'),
 ]
 
 
@@ -168,14 +231,18 @@ def run_case(label, fname, fixed, buggy, expect):
     os.makedirs(SCRATCH)
     for f in ('index.js', 'test_tmc.mjs', 'manifest.json', 'style.css'):
         shutil.copy(os.path.join(SRC, f), os.path.join(SCRATCH, f))
-    os.symlink(os.path.join(SRC, 'node_modules'), os.path.join(SCRATCH, 'node_modules'))
+    # On Windows the scratch is inside the extension dir, so the parent
+    # chain resolves jsdom/jquery exactly as for the real suite — no link
+    # needed (and symlink privileges are often unavailable: WinError 1314).
+    if os.name != 'nt':
+        os.symlink(os.path.join(SRC, 'node_modules'), os.path.join(SCRATCH, 'node_modules'))
 
     p = os.path.join(SCRATCH, fname)
     s = io.open(p, encoding='utf-8').read()
     if s.count(fixed) != 1:
         print(f'  SETUP FAIL {label}: anchor found {s.count(fixed)} times')
         return False
-    io.open(p, 'w', encoding='utf-8').write(s.replace(fixed, buggy, 1))
+    io.open(p, 'w', encoding='utf-8', newline='\n').write(s.replace(fixed, buggy, 1))
 
     r = subprocess.run(['node', 'test_tmc.mjs'], cwd=SCRATCH,
                        capture_output=True, text=True, timeout=180)
@@ -197,7 +264,7 @@ def run_case(label, fname, fixed, buggy, expect):
 
 
 ok = 0
-print('NEGATIVE GATE — reintroducing each v0.14.0+v0.15.0 bug\n')
+print('NEGATIVE GATE — reintroducing each v0.14.0+v0.15.0+v0.16.0 bug\n')
 for c in CASES:
     if run_case(*c):
         ok += 1

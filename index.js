@@ -1,6 +1,16 @@
 /**
  * Too Many Chats - SillyTavern Extension
  * Chat organization and stuff
+ * v0.16.0 - Fail-safe + robustness pass: bulk delete can no longer fail
+ *           silently (zero deleted is an explicit error; the native-button
+ *           fallback no longer counts unconfirmed clicks as deleted), the
+ *           content cache is larger than the 30-row search render slab (no
+ *           guaranteed LRU thrash — and its re-downloads — per keystroke),
+ *           fetches in flight when a message lands can't write stale content
+ *           back into the cache, transient fetch failures retry after 30s
+ *           instead of poisoning previews for the whole session, and the
+ *           native chat list is only hidden once a proxy render has actually
+ *           succeeded (the body.tmc-live gate in style.css).
  * v0.15.0 - Chat rows now lead with the BEGINNING of the last message (ST's
  *           /api/chats/search preview is the message TAIL — '…' + final 400
  *           chars — which is what every row used to show), and a chat opened
@@ -80,11 +90,31 @@
     //     too large" but no clearing code existed. Whole multi-MB chats
     //     accumulated for the lifetime of the page — real jank on Android.
     //     Now a small LRU: least-recently-used entries are evicted.
-    const CONTENT_CACHE_MAX = 24;
+    // v0.16.0: 24 was SMALLER than the search-mode render slab (30 rows,
+    // see performSync) — rendering 30 rows through a 24-slot LRU evicted
+    // the first 6 keys mid-pass, so the next keystroke re-downloaded them
+    // in full (up to ENRICH_MAX_BYTES each). Steady state was ~6 full-chat
+    // fetches PER KEYSTROKE for the whole search, exactly the jank this
+    // cache exists to prevent. The cap must stay ≥ the slab size.
+    const CONTENT_CACHE_MAX = 48;
     let chatContentCache = {};
     let contentCacheOrder = []; // LRU order, oldest first
     // In-flight fetches (same keying), to dedupe concurrent requests.
     let chatContentPromises = {};
+    // v0.16.0: cache generation. Bumped by invalidateChatContentCaches()
+    // when the open chat's content changed. A fetch that was in flight at
+    // that moment holds the old generation and must NOT write its (now
+    // stale) result back into the cache — clearing the maps alone did not
+    // stop that write-back, which re-poisoned the cache with pre-turn
+    // content until the next message event.
+    let contentCacheGeneration = 0;
+    // v0.16.0: a FAILED fetch used to be cached as [] FOREVER (and as '' in
+    // beginningPreviewCache), so one network hiccup killed that chat's
+    // previews for the whole session. Failures are still cached (to bound
+    // retry traffic), but only for this long — after it, the entry reads
+    // as a miss and the network gets another chance.
+    const CONTENT_ERROR_RETRY_MS = 30000;
+    let chatContentErrAt = {}; // key -> timestamp of the last FAILED fetch
 
     function contentCacheKey(fileName) {
         return String(getCurrentCharacterId() ?? '?') + '::' + fileName;
@@ -97,6 +127,7 @@
         while (contentCacheOrder.length > CONTENT_CACHE_MAX) {
             const evicted = contentCacheOrder.shift();
             delete chatContentCache[evicted];
+            delete chatContentErrAt[evicted]; // error stamps never outlive their cache entry
         }
     }
 
@@ -1153,13 +1184,22 @@
     // it just means that one entry keeps showing its normal last-message preview.
     async function fetchChatMessages(fileName) {
         const key = contentCacheKey(fileName);
-        if (chatContentCache[key]) {
+        // v0.16.0: a cached entry whose fetch FAILED only counts as a hit for
+        // CONTENT_ERROR_RETRY_MS (bounding retry traffic to once per window);
+        // after that it reads as a miss and the network gets another chance.
+        const errStale = chatContentErrAt[key]
+            && (Date.now() - chatContentErrAt[key]) >= CONTENT_ERROR_RETRY_MS;
+        if (chatContentCache[key] && !errStale) {
             touchContentCache(key);
             return chatContentCache[key];
         }
         if (chatContentPromises[key]) return chatContentPromises[key];
 
         const promise = (async () => {
+            // v0.16.0: a MESSAGE_* event may fire (and bump the generation)
+            // while this fetch is in the air — captured here so the result
+            // can be refused if the cache was invalidated meanwhile.
+            const gen = contentCacheGeneration;
             try {
                 const context = SillyTavern.getContext();
                 const headers = (typeof context.getRequestHeaders === 'function')
@@ -1192,14 +1232,29 @@
                     ? data.filter(m => m && typeof m.mes === 'string').map(m => m.mes)
                     : [];
 
-                chatContentCache[key] = messages;
-                touchContentCache(key);
+                // v0.16.0: if the generation moved on, the chat changed while
+                // this fetch was in flight — the content just read is the OLD
+                // turn. Serve it to this render pass, but do NOT write it
+                // into the cache: the stale copy would outlive the
+                // invalidation and the next popup would show the pre-turn
+                // preview until yet another message landed.
+                if (gen === contentCacheGeneration) {
+                    delete chatContentErrAt[key];
+                    chatContentCache[key] = messages;
+                    touchContentCache(key);
+                }
                 return messages;
             } catch (err) {
                 console.warn('[TMC] Could not fetch chat content for search preview:', fileName, err);
+                // v0.16.0: cache the failure briefly (see CONTENT_ERROR_RETRY_MS)
+                // so a flaky endpoint is not hammered once per sync, and
+                // resolve to null so callers can tell "fetch failed" apart
+                // from "fetched, but empty" — a network error must never mark
+                // a chat as permanently known-empty.
+                chatContentErrAt[key] = Date.now();
                 chatContentCache[key] = [];
                 touchContentCache(key);
-                return [];
+                return null;
             } finally {
                 delete chatContentPromises[key];
             }
@@ -1271,6 +1326,9 @@
 
         fetchChatMessages(fileName).then(messages => {
             if (!el.isConnected) return; // block was removed/re-rendered already
+            // v0.16.0: null = the FETCH failed — nothing is known yet, leave
+            // the native preview alone and let a later render retry.
+            if (messages === null) return;
 
             const snippet = buildContextSnippet(messages, searchTerm);
             if (!snippet) return; // no match in content - leave last-message preview as-is
@@ -1314,6 +1372,12 @@
         if (cached === '') return; // known empty/failed — keep native preview
 
         fetchChatMessages(fileName).then(messages => {
+            // v0.16.0: null = the FETCH failed. Nothing is "known" about this
+            // chat yet, so nothing is cached — the '' sentinel used to be
+            // written here too, poisoning the preview for the session. A
+            // genuinely empty chat (fetched fine, nothing usable) still
+            // caches '' so it is not refetched on every sync.
+            if (messages === null) return; // transient failure — keep native preview, retry next render
             const beginning = buildBeginningPreview(messages);
             beginningPreviewCache[key] = beginning || '';
             if (!beginning || !el.isConnected) return; // keep native preview
@@ -1328,9 +1392,14 @@
     // fail-soft; wholesale invalidation on message events is the one rule
     // that can never serve a stale preview.
     function invalidateChatContentCaches() {
+        // v0.16.0: bump the generation FIRST — fetches still in flight hold
+        // the old one and will no longer write their (now stale) results
+        // back into the cache when they resolve.
+        contentCacheGeneration++;
         for (const k of Object.keys(chatContentCache)) delete chatContentCache[k];
         contentCacheOrder.length = 0;
         for (const k of Object.keys(beginningPreviewCache)) delete beginningPreviewCache[k];
+        for (const k of Object.keys(chatContentErrAt)) delete chatContentErrAt[k];
     }
 
 
@@ -1867,6 +1936,13 @@
                 // Cards mode returns early, so it must paint the header itself
                 // — this is the branch where the Cards toggle actually goes ON.
                 refreshHeaderState(popup);
+                // v0.16.0 FAIL-SAFE: style.css parks ST's native chat list
+                // off-screen ONLY under body.tmc-live. The class is added
+                // exclusively on render paths that completed, so an extension
+                // whose JS died before ever rendering leaves the class unset,
+                // the hiding rules inert, and the user a fully working native
+                // chat list instead of an empty popup.
+                document.body.classList.add('tmc-live');
                 // A different list entirely: don't hand its scroll offset back
                 // to the per-card tree when we leave.
                 lastListIdentity = 'cards';
@@ -1880,6 +1956,8 @@
             if (!characterId) {
                 proxyRoot.innerHTML = '<div style="padding:12px;opacity:0.6">Select a character</div>';
                 lastSyncedCharacterId = null;
+                // v0.16.0 FAIL-SAFE — the proxy is functional here too.
+                document.body.classList.add('tmc-live');
                 return;
             }
 
@@ -2069,6 +2147,9 @@
 
             injectAddButton(popup);
             refreshHeaderState(popup);
+            // v0.16.0 FAIL-SAFE — see the cards-mode branch above: the native
+            // list is only hidden once this render has actually succeeded.
+            document.body.classList.add('tmc-live');
 
         } catch (err) {
             console.error('[TMC] Sync Error:', err);
@@ -2940,8 +3021,10 @@
                         originalBlock?.querySelector('.fa-skull') ||
                         originalBlock?.querySelector('[class*="delete"]');
                     if (delBtn) {
+                        // v0.16.0: no deletedCount++ here — ST's own confirm
+                        // dialog decides, and a cancelled confirmation used
+                        // to be counted as a deletion (the success toast lied).
                         delBtn.click();
-                        deletedCount++;
                         await new Promise(r => setTimeout(r, 80));
                     }
                 }
@@ -2959,6 +3042,13 @@
             if (deletedCount > 0 && !fallbackNeeded) {
                 toastr.success(`Deleted ${deletedCount} chat${deletedCount !== 1 ? 's' : ''}`);
                 scheduleSync();
+            }
+            // v0.16.0: a destructive operation must never fail silently. Every
+            // per-chat failure above is only console.warn'd; if NOTHING was
+            // deleted (import worked, but every helper call threw), the old
+            // code showed no toast at all and the selection just vanished.
+            if (deletedCount === 0 && !fallbackNeeded && toDelete.length > 0) {
+                toastr.error(`Could not delete any of the ${toDelete.length} selected chat${toDelete.length !== 1 ? 's' : ''} — see browser console (F12) for details`);
             }
             if (skippedOpen) {
                 toastr.warning(`Skipped ${skippedOpen} open chat — close or switch away from it first`);
@@ -3251,7 +3341,7 @@
     // ========== INIT ==========
 
     function init() {
-        console.log(`[${EXTENSION_NAME}] v0.15.0 Loading...`);
+        console.log(`[${EXTENSION_NAME}] v0.16.0 Loading...`);
         const ctx = SillyTavern.getContext();
 
         // v0.11.0 one-time migration: normalize + dedupe stored folder chat

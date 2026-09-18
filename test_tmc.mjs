@@ -244,13 +244,17 @@ console.log('[14] Content cache LRU: cap, eviction order, touch-refresh');
     assert(!!capMatch, 'cap constant present');
     const cap = parseInt(capMatch[1], 10);
     const mk = new Function('CONTENT_CACHE_MAX',
-        'let chatContentCache = {}; let contentCacheOrder = [];\n'
+        // v0.16.0: touchContentCache also evicts the per-key error stamps —
+        // the sandbox must declare chatContentErrAt or the guard throws.
+        'let chatContentCache = {}; let contentCacheOrder = []; let chatContentErrAt = {};\n'
         + extract('touchContentCache')
-        + '\nreturn { touch: touchContentCache, set: (k) => { chatContentCache[k] = [k]; touchContentCache(k); }, cache: () => chatContentCache, order: () => contentCacheOrder };');
+        + '\nreturn { touch: touchContentCache, set: (k) => { chatContentCache[k] = [k]; chatContentErrAt[k] = 1; touchContentCache(k); }, cache: () => chatContentCache, order: () => contentCacheOrder, err: () => chatContentErrAt };');
     const c = mk(cap);
     for (let i = 0; i < cap + 6; i++) c.set('A.png::chat' + i);
     assert(Object.keys(c.cache()).length === cap, `cache bounded at ${cap} after ${cap + 6} inserts`);
     assert(!c.cache()['A.png::chat0'] && !!c.cache()['A.png::chat' + (cap + 5)], 'oldest evicted, newest kept');
+    // v0.16.0: an evicted entry's error stamp goes with it
+    assert(!c.err()['A.png::chat0'], 'error stamp evicted with its cache entry');
     // touch-refresh: oldest surviving key touched, then one more insert evicts the SECOND-oldest instead
     const survivors = c.order().slice();
     c.touch(survivors[0]);
@@ -1106,6 +1110,7 @@ console.log('[59] v0.14.0: CSS contract — every class the JS applies is styled
         'tmc_cards_note', 'tmc_card_chat', 'tmc_card_chat_title',
         'tmc_card_chat_preview', 'tmc_charpicker_filter', 'tmc_ctx_current',
         'tmc_ctx_head', 'tmc_ctx_item', 'tmc_ctx_sep', 'tmc_mobile_menu',
+        'tmc-live',
     ];
     const missing = owned.filter(c => src.includes(c) && !css.includes('.' + c));
     assert(missing.length === 0, 'no JS-applied class is left unstyled' +
@@ -1223,11 +1228,78 @@ console.log('[63] v0.15.0: message events invalidate preview/content caches');
         'bare stampActivity subscription replaced');
 
     const cc = { 'C::a': ['x'] }, order = ['C::a'], bc = { 'C::a': 'y' };
-    const inv = new Function('chatContentCache', 'contentCacheOrder', 'beginningPreviewCache',
-        extract('invalidateChatContentCaches') + '\nreturn invalidateChatContentCaches;')(cc, order, bc);
-    inv();
+    // v0.16.0: invalidation now also bumps the cache generation and clears
+    // the error-stamp map — both must be in the sandbox or the guard itself
+    // would crash instead of asserting.
+    const errs = { 'C::a': 123 }, promises = { 'C::a': {} };
+    let gen = 7;
+    const inv = new Function('chatContentCache', 'contentCacheOrder', 'beginningPreviewCache', 'chatContentErrAt', 'chatContentPromises', 'contentCacheGeneration',
+        extract('invalidateChatContentCaches') + '\nreturn { run: invalidateChatContentCaches, gen: () => contentCacheGeneration };')(
+        cc, order, bc, errs, promises, { valueOf: () => gen, toString: () => String(gen) });
+    inv.run();
     assert(Object.keys(cc).length === 0 && order.length === 0 && Object.keys(bc).length === 0,
         'invalidation empties content cache, LRU order, and beginning cache');
+    assert(Object.keys(errs).length === 0, 'v0.16.0: error-stamp map cleared too');
+    assert(inv.gen() === 8, 'v0.16.0: generation bumped (in-flight fetches will refuse to cache)');
+}
+
+console.log('[64] v0.16.0: silent bulk-delete failure, LRU/slab sizing, stale write-back, fail-safe CSS');
+{
+    const css = readFileSync('./style.css', 'utf8');
+
+    // (a) bulk delete can never fail silently: zero deleted (helpers worked,
+    //     every call threw) must surface an error, not silence.
+    const ub = stripComments(extract('updateBulkBar'));
+    assert(ub.includes('deletedCount === 0 && !fallbackNeeded && toDelete.length > 0'),
+        'zero-deleted bulk delete raises an explicit error toast');
+    assert(!/delBtn\.click\(\);\s*\r?\n?\s*deletedCount\+\+/.test(ub),
+        'native-click fallback no longer counts unconfirmed clicks as deleted');
+
+    // (b) the content cache must be at least as large as the search render
+    //     slab, or the LRU evicts mid-pass and every keystroke re-downloads.
+    const cap64 = parseInt((src.match(/const CONTENT_CACHE_MAX = (\d+);/) || [])[1], 10);
+    const slab64 = parseInt((src.match(/Math\.min\(sectionLen, Math\.max\((\d+),/) || [])[1], 10);
+    assert(cap64 >= 30 && slab64 <= cap64,
+        `content cache (${cap64}) >= search render slab (${slab64}) — no guaranteed LRU thrash`);
+
+    // (c) a fetch in flight when the generation moved on must not write back.
+    const fcm = stripComments(extract('fetchChatMessages'));
+    assert(fcm.includes('const gen = contentCacheGeneration;'),
+        'fetch captures the cache generation at start');
+    assert(fcm.includes('if (gen === contentCacheGeneration) {'),
+        'stale-generation results are served but never cached');
+    assert(fcm.includes('CONTENT_ERROR_RETRY_MS') && fcm.includes('return null;'),
+        'fetch failures are TTL-bounded and resolve to null (never "known-empty")');
+    const epw = stripComments(extract('enrichPreviewWithBeginning'));
+    assert(epw.includes('if (messages === null) return;'),
+        'a failed fetch never poisons the beginning-preview cache');
+    const epw2 = stripComments(extract('enrichPreviewWithContext'));
+    assert(epw2.includes('if (messages === null) return;'),
+        'a failed fetch never replaces the native preview either');
+
+    // (d) fail-safe: the native list is hidden ONLY behind body.tmc-live,
+    //     which the JS sets exclusively on render paths that completed.
+    const ps64 = stripComments(extract('performSync'));
+    const gateAdds = (ps64.match(/document\.body\.classList\.add\('tmc-live'\)/g) || []).length;
+    assert(gateAdds >= 2, `render-success paths gate the CSS (${gateAdds} sites incl. the cards early return)`);
+    // anchored to the MAIN render tail specifically: with three gate sites,
+    // a bare >= 2 count could no longer catch the removal of any single one.
+    // The main tail is the only gate followed by performSync's catch — the
+    // cards early return also runs injectAddButton+refreshHeaderState, so
+    // those two calls alone do not identify it.
+    assert(/document\.body\.classList\.add\('tmc-live'\);\s*\} catch \(err\) \{/.test(ps64),
+        'main render tail gates the CSS right before the sync catch');
+    // and to the CARDS early return: its gate immediately precedes the list
+    // identity handoff, which no other render path does.
+    assert(/document\.body\.classList\.add\('tmc-live'\);\s*lastListIdentity = 'cards';/.test(ps64),
+        'cards early return gates the CSS before handing off list identity');
+    assert(css.includes('body.tmc-live #select_chat_div'),
+        'native-list hiding rule is scoped under body.tmc-live');
+    const selectorLines = css.split('\n')
+        .map(l => l.trim())
+        .filter(l => l.endsWith('{') && (l.includes('#select_chat_div') || l.includes('.select_chat_block_wrapper')));
+    assert(selectorLines.length > 0 && selectorLines.every(l => l.startsWith('body.tmc-live')),
+        'every native-list hiding selector is gated (an ungated rule would blank the popup if JS dies)');
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
