@@ -17,29 +17,68 @@ function extract(name) {
     return src.slice(start, i + 1);
 }
 
+// comment stripper usable from the first test onward (the [6] block defines
+// its own `stripComments` later; keep both rather than reorder that block)
+const stripCommentsEarly = (s) => s.split('\n').map(l => l.replace(/\/\/.*$/, '')).join('\n');
+
 // --- DOM + ST stubs ---
 const dom = new JSDOM('<!doctype html><body></body>');
 globalThis.document = dom.window.document;
 
-const fnSource = ['escapeHtml', 'highlightText', 'getActiveChatName', 'isActiveChatFile'].map(extract).join('\n');
+const fnSource = ['escapeHtml', 'splitHighlight', 'applyHighlight', 'getActiveChatName', 'isActiveChatFile'].map(extract).join('\n');
 const api = new Function('SillyTavern', 'document', fnSource +
-    '\nreturn { escapeHtml, highlightText, getActiveChatName, isActiveChatFile };');
+    '\nreturn { escapeHtml, splitHighlight, applyHighlight, getActiveChatName, isActiveChatFile };');
 
-console.log('[1] XSS fix: real DOM round-trip proof');
+console.log('[1] Highlighting is a DOM operation, not an HTML string (v0.14.0)');
 {
-    const { escapeHtml, highlightText } = api({ getContext: () => ({}) }, document);
-    const evil = '<img src=x onerror=alert(1)> chat about stuff';
+    const { splitHighlight, applyHighlight } = api({ getContext: () => ({}) }, document);
     const probe = document.createElement('div');
 
-    // NEW code path: escape first, then highlight
-    probe.innerHTML = highlightText(escapeHtml(evil), 'chat');
-    assert(probe.querySelector('img') === null, 'fixed path: no <img> element ever created');
-    assert(probe.textContent.includes('<img src=x onerror=alert(1)>'), 'fixed path: tag visible as literal text');
-    assert(probe.querySelectorAll('span').length === 1, 'fixed path: highlight span still applied');
+    // A. markup in the source text can never become markup in the DOM, and
+    //    there is no escape-then-highlight ordering left to get wrong.
+    const evil = '<img src=x onerror=alert(1)> chat about stuff';
+    applyHighlight(probe, evil, 'chat');
+    assert(probe.querySelector('img') === null, 'no <img> element ever created');
+    assert(probe.textContent === evil, 'text survives byte-for-byte as literal text');
+    assert(probe.querySelectorAll('span.tmc_hl').length === 1, 'highlight span applied');
+    assert(probe.querySelector('span.tmc_hl').textContent === 'chat', 'span wraps exactly the match');
 
-    // OLD code path (pre-fix): raw title straight into highlightText
-    probe.innerHTML = highlightText(evil, 'chat');
-    assert(probe.querySelector('img') !== null, 'sanity: old path really did create an <img> element (exploitable)');
+    // B. THE entity bug of the old regex-over-escaped-HTML path: searching a
+    //    character that escapes into an entity used to slice the entity apart
+    //    ("&amp;" -> "&<span>amp;</span>").
+    applyHighlight(probe, 'Tom & Jerry & co', '&');
+    assert(probe.textContent === 'Tom & Jerry & co', 'ampersand search leaves text intact');
+    assert(probe.querySelectorAll('span.tmc_hl').length === 2, 'both ampersands highlighted');
+    assert(!probe.innerHTML.includes('amp;amp;'), 'no double-escaping');
+
+    // C. "<" was unreachable before (haystack held "&lt;", needle held "<")
+    applyHighlight(probe, 'a <b> c', '<b>');
+    assert(probe.querySelectorAll('span.tmc_hl').length === 1, 'angle-bracket term now matches');
+    assert(probe.textContent === 'a <b> c', 'and stays text');
+
+    // D. regex metacharacters in the term are inert by construction
+    assert(splitHighlight('a.b axb', '.').filter(p => p.hit).length === 1,
+        'dot is literal, not "any char"');
+    assert(splitHighlight('nothing here', '(').filter(p => p.hit).length === 0,
+        'unbalanced paren cannot throw or match');
+
+    // E. purity / degenerate inputs
+    assert(splitHighlight('abc', '').map(p => p.text).join('') === 'abc', 'empty term returns whole text');
+    assert(splitHighlight('', 'x')[0].text === '', 'empty text is safe');
+    assert(splitHighlight(null, null)[0].text === '', 'null-ish inputs are safe');
+    assert(splitHighlight('aaa', 'aa').filter(p => p.hit).length === 1,
+        'overlapping matches advance past the hit (no infinite loop)');
+    assert(splitHighlight('xAbCx', 'abc').filter(p => p.hit)[0].text === 'AbC',
+        'case-insensitive match preserves original casing');
+
+    // NEGATIVE: the HTML-string highlighter must be gone from the source.
+    assert(!src.includes('function highlightText('), 'the HTML-string highlighter no longer exists');
+    assert(!src.includes('background-color: rgba(255, 255, 0, 0.3)'),
+        'hardcoded inline highlight colour gone (was invisible on light themes)');
+    assert(!/titleEl\.innerHTML/.test(stripCommentsEarly(extract('createProxyBlock'))),
+        'title is no longer built via innerHTML');
+    assert(!/previewEl\.innerHTML/.test(stripCommentsEarly(extract('enrichPreviewWithContext'))),
+        'snippet preview is no longer built via innerHTML');
 }
 
 console.log('[2] isActiveChatFile: solo chat via context.chatId');
@@ -372,7 +411,11 @@ console.log('[26] Chat id normalization: folders survive with/without .jsonl era
 {
     const shared26 = { folders: { f1: { name: 'F', chats: ['Old Tale.jsonl'] } }, characterFolders: { 'A.png': ['f1'] } };
     const mk = new Function('getSettings', 'getCurrentCharacterId', 'saveSettings', 'scheduleSync',
-        extract('normalizeChatId') + '\n' + extract('moveChat') + '\n' + extract('getFolderForChat')
+        // v0.14.0: moveChat delegates to moveChats — a sandboxed function's
+        // callees must be in the extraction list or the ReferenceError
+        // surfaces as an unrelated failure (see AGENTS.md).
+        extract('normalizeChatId') + '\n' + extract('moveChat') + '\n' + extract('moveChats')
+        + '\n' + extract('getFolderForChat')
         + '\nreturn { moveChat, getFolderForChat };');
     const api26 = mk(() => shared26, () => 'A.png', () => {}, () => {});
     assert(api26.getFolderForChat('Old Tale') === 'f1', 'legacy .jsonl-stored id matches current extensionless block');
@@ -407,7 +450,13 @@ console.log('[29] Scroll + rendered-depth persistence across re-syncs');
     const rb = stripComments(extract('renderBatch'));
     assert(rb.includes('renderedCounts[folderId] = Math.max'), 'renderBatch records section depth');
     const ps = stripComments(extract('performSync'));
-    assert(ps.includes('lastScrollTop = body.scrollTop') && ps.includes('body.scrollTop = lastScrollTop'), 'scroll captured and restored around rebuild');
+    // v0.14.0: this used to assert `body.scrollTop`, where `body` resolved to
+    // #shadow_select_chat_popup — an element with no overflow, whose scrollTop
+    // is permanently 0. The assertion passed while the feature did nothing.
+    // It is now pinned to the resolved scroll container.
+    assert(ps.includes('scroller.scrollTop || 0') && ps.includes('scroller.scrollTop = lastScrollTop'),
+        'scroll captured and restored around rebuild, on the element that actually scrolls');
+    assert(!ps.includes('body.scrollTop'), 'no scroll access on the non-scrolling popup element');
     assert(ps.includes('renderedCounts = {};') && ps.includes('lastSearchTermSeen'), 'depths reset when the search term changes');
     assert(ps.includes('Math.min(renderedCounts[fid] || 0, sectionLen)'), 'initial batch restores remembered depth (clamped)');
     assert(stripComments(extract('syncPanelVisibility')).includes('renderedCounts = {}'), 'depths reset on popup close');
@@ -436,8 +485,24 @@ console.log('[32] Title resolver + jump-to-open');
     const t = getTitle(el);
     assert(t && t.textContent === 'My Chat', 'current ST title class resolved (highlighting/chips land in the title row again)');
     const ib = stripComments(extract('injectAddButton'));
-    assert(ib.includes('tmc_jump_btn') && ib.includes('scrollIntoView'), 'jump-to-open button wired');
+    assert(ib.includes('tmc_jump_btn') && ib.includes('jumpToOpenChat(popup)'), 'jump-to-open button wired');
     assert(!src.includes('createRecentDOM'), 'dead createRecentDOM removed');
+
+    // v0.14.0: the button used to give up with "not in the current view"
+    // whenever the open chat was not currently RENDERED — the common case,
+    // since main view truncates every manual folder to 3 rows. It now
+    // navigates to where the chat lives and retries.
+    const jo = stripComments(extract('jumpToOpenChat'));
+    assert(jo.includes('scrollIntoView'), 'still scrolls when the row is on screen');
+    assert(jo.includes('getFolderForChat(active)') && jo.includes("currentView = 'folder'"),
+        'drills into the folder holding the open chat');
+    assert(jo.includes('familyCollapseKey(root)') && jo.includes('delete settings.familyCollapsed[key]'),
+        'expands the family section holding the open chat');
+    assert(jo.includes('cardsMode = false'), 'steps out of the cross-card browser first');
+    assert(jo.includes('performSync()') && (jo.match(/flash\(\)/g) || []).length >= 3,
+        'renders, then retries the scroll');
+    assert(!jo.includes('Open chat is not in the current view'),
+        'the old dead-end message is gone');
 }
 
 
@@ -451,7 +516,10 @@ console.log('[33] pickFreeName: never overwrite on the target card');
 
 console.log('[34] adaptChatForTarget: header + source-named AI messages only');
 {
-    const adapt = new Function(extract('adaptChatForTarget') + '\nreturn adaptChatForTarget;')();
+    // v0.14.0: adaptChatForTarget now mints a fresh integrity token, so its
+    // callee must be in the extraction list (see AGENTS.md).
+    const adapt = new Function('crypto', extract('freshIntegrity') + '\n' + extract('adaptChatForTarget')
+        + '\nreturn adaptChatForTarget;')({ randomUUID: () => 'NEW-UUID' });
     const input = [
         { user_name: 'LO', character_name: 'Seika', chat_metadata: { main_chat: 'X' } },
         { name: 'Seika', is_user: false, mes: 'hello' },
@@ -487,9 +555,18 @@ console.log('[35] buildCardsOverview: per-card sections, name resolution, orderi
 console.log('[36] moveChatToCharacter: loss-safe pipeline ordering');
 {
     const calls = [];
+    // v0.14.0: /get now serves TWO purposes — reading the source chat and
+    // probing whether the destination name is already taken. The mock
+    // distinguishes them by avatar_url, exactly as the server does.
     const mkFetch = (opts) => async (url, init) => {
-        const kind = url.includes('/get') ? 'get' : url.includes('/save') ? 'save' : url.includes('/delete') ? 'delete' : url;
+        const body = init && init.body ? JSON.parse(init.body) : {};
+        const isProbe = url.includes('/get') && body.avatar_url === 'Dst.png';
+        const kind = isProbe ? 'probe'
+            : url.includes('/get') ? 'get'
+                : url.includes('/save') ? 'save'
+                    : url.includes('/delete') ? 'delete' : url;
         calls.push(kind);
+        if (kind === 'probe') return { ok: true, json: async () => (opts.destTaken ? [{ mes: 'someone else' }] : []) };
         if (kind === 'get') return { ok: true, json: async () => (opts.emptyGet ? [] : [{ user_name: 'u', character_name: 'Src' }, { name: 'Src', is_user: false, mes: 'm' }]) };
         if (kind === 'save') return { ok: !opts.saveFail, json: async () => ({ ok: !opts.saveFail }) };
         if (kind === 'delete') return { ok: !opts.deleteFail };
@@ -500,7 +577,9 @@ console.log('[36] moveChatToCharacter: loss-safe pipeline ordering');
         deps
         + '\nconst getSettings = () => settingsObj; const saveSettings = () => {}; const scheduleSync = () => {};'
         + '\nconst findNativeBlock = () => null; const pruneLastActive = () => {};'
-        + '\n' + extract('normalizeChatId') + '\n' + extract('stHeaders') + '\n' + extract('adaptChatForTarget') + '\n' + extract('pickFreeName')
+        + '\n' + extract('normalizeChatId') + '\n' + extract('stHeaders') + '\n' + extract('freshIntegrity') + '\n' + extract('adaptChatForTarget') + '\n' + extract('pickFreeName')
+        + '\n' + extract('stripDeletedFromFolders')
+        + '\nasync ' + extract('targetChatExists')
         + '\nasync ' + extract('moveChatToCharacter')
         + '\nreturn { move: moveChatToCharacter, settings: () => settingsObj };')(
         mkFetch(opts), { getContext: () => ({ getRequestHeaders: () => ({}) }) }, { }, console);
@@ -508,7 +587,8 @@ console.log('[36] moveChatToCharacter: loss-safe pipeline ordering');
     // happy path
     let h = build({});
     let r = await h.move('Tale.jsonl', 'Src.png', 'Src', { avatar: 'Dst.png', name: 'Dst' }, new Set());
-    assert(r.ok === true && calls.join('>') === 'get>save>delete', 'order: read -> write target -> delete source');
+    assert(r.ok === true && calls.join('>') === 'get>probe>save>delete',
+        'order: read source -> probe destination -> write target -> delete source');
     assert(h.settings().lastActive['Dst.png::Tale'] > 0, 'moved chat stamped on the TARGET card');
     // save failure aborts BEFORE delete
     calls.length = 0;
@@ -522,6 +602,16 @@ console.log('[36] moveChatToCharacter: loss-safe pipeline ordering');
     calls.length = 0;
     r = await build({ emptyGet: true }).move('Tale', 'Src.png', 'Src', { avatar: 'Dst.png', name: 'Dst' }, new Set());
     assert(r.ok === false && !calls.includes('save'), 'unreadable source -> no write attempted');
+
+    // v0.14.0: an occupied destination must NEVER be written over. The
+    // listing-derived takenSet cannot see this (the server sanitizes the name
+    // after we choose it), so the probe is the guard that matters.
+    calls.length = 0;
+    r = await build({ destTaken: true }).move('Tale', 'Src.png', 'Src', { avatar: 'Dst.png', name: 'Dst' }, new Set());
+    assert(r.ok === false, 'permanently-occupied destination -> move refused');
+    assert(!calls.includes('save') && !calls.includes('delete'),
+        'nothing written and nothing deleted: the source survives intact');
+    assert(calls.filter(c => c === 'probe').length > 1, 'alternative names were tried before giving up');
 }
 
 console.log('[37] v0.12.0 wiring');
@@ -585,6 +675,559 @@ console.log('[40] Feedback wiring');
     assert(cf.includes('return folderId;') && cf.includes('return null;'), 'createFolder returns fid / null');
     const cpb = stripComments(extract('createProxyBlock'));
     assert(cpb.includes('tmc_activity_hint') && cpb.includes('shownDate + 60000'), 'stamp-driven ordering surfaced as a chip when it outranks the visible date');
+}
+
+console.log('[41] partitionPinned: pins float without inverting their order');
+{
+    const fn = new Function(extract('partitionPinned') + '\nreturn partitionPinned;')();
+    const list = ['p1', 'a', 'p2', 'b', 'p3'];
+    const isPin = x => x.startsWith('p');
+    assert(fn(list, isPin).join('|') === 'p1|p2|p3|a|b', 'pinned cluster keeps global sort order, rest follows');
+    // negative proof: the OLD unshift-per-pin flow produced the reverse
+    const old = []; for (const x of list) { if (isPin(x)) old.unshift(x); else old.push(x); }
+    assert(old.join('|') === 'p3|p2|p1|a|b', 'sanity: old flow really did invert pinned order (the bug)');
+    assert(fn([], isPin).length === 0 && fn(null, isPin).length === 0, 'empty / null inputs safe');
+}
+
+console.log('[42] reuseCachedNative: survives ST rebuilding blocks per search keystroke');
+{
+    const fn = new Function(extract('reuseCachedNative') + '\nreturn reuseCachedNative;')();
+    const mk = (text) => { const d = document.createElement('div'); d.textContent = text; return d; };
+    const b1 = mk('Tale  Jul 29, 2026 4:00 PM (2KB, 12 msgs) last line');
+    const cached = { element: b1, signature: b1.textContent, html: '<i>parsed</i>' };
+    assert(fn(cached, b1) === true, 'identity hit still reuses');
+    const rebuilt = mk('Tale  Jul 29, 2026 4:00 PM (2KB, 12 msgs) last line');
+    assert(cached.element !== rebuilt, 'sanity: rebuilt block is a different element (identity-only cache missed here)');
+    assert(fn(cached, rebuilt) === true, 'rebuilt-but-identical block reuses the parse (THE fix)');
+    assert(cached.element === rebuilt, 'cache adopts the new element');
+    const changed = mk('Tale  Jul 29, 2026 4:05 PM (3KB, 13 msgs) newer line');
+    assert(fn(cached, changed) === false, 'real content change invalidates (new message -> re-parse)');
+    assert(fn(undefined, b1) === false, 'no cache entry -> parse');
+    assert(fn({ element: mk('x') }, mk('')) === false, 'legacy entry without signature + different element -> re-parse, never false-reuse');
+}
+
+console.log('[43] migrateChatRename: rename keeps folder, pin, stamp, collapse state');
+{
+    const fn = new Function(extract('normalizeChatId') + '\n' + extract('migrateChatRename') + '\nreturn migrateChatRename;')();
+    const mk = () => ({
+        folders: { f1: { chats: ['Old Tale'] }, f2: { chats: ['Other'] }, fx: { chats: ['Old Tale'] } },
+        characterFolders: { 'A.png': ['f1', 'f2'], 'B.png': ['fx'] },
+        pinned: { 'A.png::Old Tale': true },
+        lastActive: { 'A.png::Old Tale': 1000 },
+        familyCollapsed: { 'A.png::Old Tale': true },
+    });
+    let s = mk();
+    assert(fn(s, 'A.png', 'Old Tale', 'New Tale') === true, 'reports change');
+    assert(s.folders.f1.chats.join('|') === 'New Tale', 'folder membership follows the rename');
+    assert(s.folders.fx.chats.join('|') === 'Old Tale', 'other character\'s same-named chat untouched');
+    assert(s.pinned['A.png::New Tale'] === true && !('A.png::Old Tale' in s.pinned), 'pin follows');
+    assert(s.lastActive['A.png::New Tale'] === 1000 && !('A.png::Old Tale' in s.lastActive), 'stamp follows');
+    assert(s.familyCollapsed['A.png::New Tale'] === true && !('A.png::Old Tale' in s.familyCollapsed), 'family collapse state follows');
+    // stamp max-merge: never clobber a NEWER stamp already under the new name
+    s = mk(); s.lastActive['A.png::New Tale'] = 5000;
+    fn(s, 'A.png', 'Old Tale', 'New Tale');
+    assert(s.lastActive['A.png::New Tale'] === 5000, 'newer stamp under the new name wins (max-merge)');
+    // ghost dedupe: renaming onto a name with a stale ghost entry
+    s = mk(); s.folders.f1.chats = ['Old Tale', 'New Tale'];
+    fn(s, 'A.png', 'Old Tale', 'New Tale');
+    assert(s.folders.f1.chats.join('|') === 'New Tale', 'ghost entry under the new name deduped');
+    assert(fn(mk(), 'A.png', 'Same', 'Same') === false, 'same-name rename is a no-op');
+    assert(fn(mk(), 'A.png', 'Never Existed', 'X') === false, 'unknown chat is a clean no-op');
+}
+
+console.log('[44] stripDeletedFromFolders: normalized cleanup incl. pin + stamp');
+{
+    const fn = new Function(extract('normalizeChatId') + '\n' + extract('stripDeletedFromFolders') + '\nreturn stripDeletedFromFolders;')();
+    const s = {
+        folders: { f1: { chats: ['Tale', 'Keep'] } },
+        characterFolders: { 'A.png': ['f1'] },
+        pinned: { 'A.png::Tale': true, 'A.png::Keep': true },
+        lastActive: { 'A.png::Tale': 42, 'A.png::Keep': 43 },
+    };
+    // deleted names arrive WITH .jsonl (block spelling on some builds)
+    assert(fn(s, 'A.png', ['Tale.jsonl']) === true, 'reports change');
+    assert(s.folders.f1.chats.join('|') === 'Keep', 'normalized match removed the assignment');
+    assert(!('A.png::Tale' in s.pinned) && s.pinned['A.png::Keep'] === true, 'pin dropped for deleted, kept for others');
+    assert(!('A.png::Tale' in s.lastActive) && s.lastActive['A.png::Keep'] === 43, 'stamp dropped for deleted, kept for others');
+    // negative proof: the OLD raw-includes comparison matched nothing here
+    assert(['Tale'].filter(f => !['Tale.jsonl'].includes(f)).length === 1, 'sanity: old raw includes() left the ghost behind (the bug)');
+    assert(fn(s, null, ['x']) === false && fn(s, 'A.png', []) === false, 'no character / empty list are clean no-ops');
+}
+
+console.log('[45] clampMenuToViewport: menus always land fully on-screen');
+{
+    const fn = new Function(extract('clampMenuToViewport') + '\nreturn clampMenuToViewport;')();
+    const mkMenu = (rect) => ({ getBoundingClientRect: () => rect, style: {} });
+    const win = { innerWidth: 390, innerHeight: 800 };
+    // kebab tap near the bottom-right of a phone screen
+    let m = mkMenu({ left: 300, top: 700, right: 460, bottom: 900, width: 160, height: 200 });
+    fn(m, win);
+    assert(m.style.left === '222px', 'right overflow clamped inside viewport (390-8-160)');
+    assert(m.style.top === '592px', 'bottom overflow clamped inside viewport (800-8-200)');
+    assert(m.style.right === 'auto', 'right anchor cleared so left wins');
+    // sanity: pre-clamp the menu really did hang off-screen
+    assert(900 > win.innerHeight && 460 > win.innerWidth, 'sanity: unclamped rect overflowed both edges (the bug)');
+    // a menu already fully visible is not moved
+    m = mkMenu({ left: 40, top: 60, right: 200, bottom: 260, width: 160, height: 200 });
+    fn(m, win);
+    assert(m.style.left === '40px' && m.style.top === '60px', 'already-visible menu stays put');
+    // a menu TALLER than the viewport pins to the top pad, not negative
+    m = mkMenu({ left: 10, top: 100, right: 170, bottom: 1000, width: 160, height: 900 });
+    fn(m, win);
+    assert(m.style.top === '8px', 'oversized menu pins to top padding, never negative');
+}
+
+console.log('[46] buildFolderList: existence-based, never name-based');
+{
+    const fn = new Function(extract('buildFolderList') + '\nreturn buildFolderList;')();
+    const s = {
+        folders: { f1: { name: '?' }, f2: { name: 'Real' } },
+        characterFolders: { 'A.png': ['f1', 'f2', 'fDeleted'] },
+    };
+    const out = fn(s, 'A.png');
+    assert(out.length === 2 && out[0].name === '?' && out[1].name === 'Real', 'folder literally named "?" is included (old filter dropped it)');
+    assert(!out.some(f => f.fid === 'fDeleted'), 'dangling folder id excluded');
+    assert(fn({}, 'A.png').length === 0, 'empty settings safe');
+}
+
+console.log('[47] Family dot: lights up when ANY member is the open chat');
+{
+    const deps = 'const getSettings = () => ({ familyCollapsed: {} });'
+        + '\nconst saveSettings = () => {}; const scheduleSync = () => {};'
+        + '\nconst familyCollapseKey = (r) => "c::" + r;'
+        + '\nconst isActiveChatFile = (f) => String(f).replace(/\\.jsonl$/i, "") === ACTIVE;';
+    const build = (active) => new Function('document', 'ACTIVE',
+        deps + '\n' + extract('escapeHtml') + '\n' + extract('createFamilyDOM')
+        + '\nreturn createFamilyDOM;')(document, active);
+    let section = build('Branch 1')('Root Tale', 2, ['Root Tale', 'Branch 1']);
+    assert(section.classList.contains('tmc_has_active'), 'open BRANCH lights the family dot (THE fix)');
+    section = build('Branch 1')('Root Tale', 2);
+    assert(!section.classList.contains('tmc_has_active'), 'sanity: root-only fallback (old behavior) misses the open branch');
+    section = build('Root Tale')('Root Tale', 2, ['Root Tale', 'Branch 1']);
+    assert(section.classList.contains('tmc_has_active'), 'open root still lights it');
+    section = build('Elsewhere')('Root Tale', 2, ['Root Tale', 'Branch 1']);
+    assert(!section.classList.contains('tmc_has_active'), 'no member open -> no dot');
+}
+
+console.log('[48] v0.13.0 wiring: every fix is actually connected');
+{
+    const ps = stripComments(extract('performSync'));
+    assert(ps.includes('const visibleData = sortedData.filter'), 'visibility decided once, upstream');
+    assert(ps.includes('visibleData.map(c => c.fileName'), 'family clustering sees only visible chats');
+    assert(ps.includes('visibleData.forEach(chat =>'), 'distribution iterates the visible list');
+    assert(!ps.includes('.unshift(chat)'), 'inverting unshift-per-pin is gone');
+    assert(ps.includes('partitionPinned(chatsByFolder[fid]'), 'pin partition wired into distribution');
+    assert(ps.includes("fid === 'uncategorized' || searchTerm"), 'empty sections hidden during search');
+    assert(ps.includes('reuseCachedNative(cached, block)'), 'cache reuse goes through the signature-aware check');
+    assert(ps.includes('signature: block.textContent'), 'fresh parses store their signature');
+
+    const rb = stripComments(extract('renderBatch'));
+    assert(rb.includes('chats.length, 3)'), 'main-view 3-cap applied via endIndex, upfront');
+    assert(!rb.includes('children[i].remove()'), 'render-then-delete waste is gone');
+
+    const cm = stripComments(extract('showContextMenu'));
+    assert((cm.match(/menu\.remove\(\)/g) || []).length === 1, 'exactly one menu.remove() — inside cleanup(); action paths use cleanup()');
+    assert(cm.includes('e.clientY') && cm.includes('e.clientX') && !cm.includes('e.pageY'), 'fixed-position menu uses client coords');
+    assert(cm.includes('clampMenuToViewport(menu)'), 'clamp runs after append');
+    assert(cm.includes('buildFolderList(settings, characterId)'), 'move-to list built existence-based');
+
+    const iab = stripComments(extract('injectAddButton'));
+    assert(iab.includes('clearSelection()'), 'entering Cards mode clears bulk selection');
+
+    const fpe = stripComments(extract('findPreviewElement'));
+    assert(fpe.indexOf('.select_chat_block_mes') < fpe.indexOf('querySelectorAll'), 'stable preview class tried before the heuristic');
+
+    const mv = stripComments(extract('moveChatToCharacter'));
+    assert(mv.includes('stripDeletedFromFolders(settings, sourceAvatar'), 'move-to-card uses the canonical cleanup');
+
+    const initSrc = stripComments(extract('init'));
+    assert(initSrc.includes('CHAT_RENAMED'), 'rename event subscribed (feature-detected)');
+    assert(initSrc.includes('migrateChatRename(settings, charKey, oldId, newId)'), 'rename handler migrates bookkeeping');
+    assert(initSrc.includes('activityData.fetchedAt = 0'), 'rename forces a branch-metadata refetch');
+
+    // stamp-drift gate: manifest version must equal both in-code stamps
+    const manifest = JSON.parse(readFileSync('./manifest.json', 'utf8'));
+    assert(src.includes(`v${manifest.version} Loading...`), `init log stamp matches manifest (${manifest.version})`);
+    assert(src.includes(` * v${manifest.version} - `), `header comment stamp matches manifest (${manifest.version})`);
+}
+
+console.log('[49] v0.13.1 workflow fixes: folder-view escape, search reveals matches, sentinel term');
+{
+    const ps = stripComments(extract('performSync'));
+    // A: hide-empty can never hide the folder-view section (Back button lives there)
+    assert(ps.includes("currentView !== 'folder' && (fid === 'uncategorized' || searchTerm)"),
+        'hide-empty guarded out of folder view (zero-match search kept the Back button)');
+    // C: active search force-opens sections that hold matches, render-only
+    assert(ps.includes('if (searchTerm && sectionCount > 0)'), 'search-expand branch exists');
+    const expandIdx = ps.indexOf('if (searchTerm && sectionCount > 0)');
+    const expandBlock = ps.slice(expandIdx, ps.indexOf('}', ps.indexOf('dataset.collapsed', expandIdx)) + 1);
+    assert(expandBlock.includes("container.style.display = ''"), 'matched section content forced visible');
+    assert(expandBlock.includes("section.dataset.collapsed = 'false'"), 'chevron reflects the forced-open state');
+    assert(!expandBlock.includes('saveSettings') && !expandBlock.includes('folders['),
+        'persisted collapse flag untouched by the search override (render-only)');
+    // B: lazy-scroll continuation carries the live term
+    const io = stripComments(extract('initIntersectionObserver'));
+    assert(io.includes('renderBatch(folderId, nextIndex, BATCH_SIZE, null, lastSearchTermSeen)'),
+        'sentinel batches carry the active search term');
+    assert(!io.includes('renderBatch(folderId, nextIndex, BATCH_SIZE);'),
+        'no term-less continuation path remains');
+}
+
+console.log('[50] v0.14.0: open-chat-safe bulk delete');
+{
+    const partitionOpenChat = new Function(extract('partitionOpenChat') +
+        '\nreturn partitionOpenChat;')();
+    const isOpen = (f) => f === 'B.jsonl';
+    const r = partitionOpenChat(['A.jsonl', 'B.jsonl', 'C.jsonl'], isOpen);
+    assert(r.others.join(',') === 'A.jsonl,C.jsonl', 'non-open chats keep their order');
+    assert(r.open.join(',') === 'B.jsonl', 'the open chat is separated out');
+    assert(partitionOpenChat([], isOpen).open.length === 0, 'empty input safe');
+    assert(partitionOpenChat(null, isOpen).others.length === 0, 'non-array input safe');
+    const none = partitionOpenChat(['A', 'C'], isOpen);
+    assert(none.open.length === 0 && none.others.length === 2, 'no open chat -> nothing special');
+
+    // wiring: the open chat goes through ST's chat-aware teardown, LAST
+    const bar = stripCommentsEarly(extract('updateBulkBar'));
+    assert(bar.includes('partitionOpenChat(toDelete, isActiveChatFile)'),
+        'bulk delete partitions on the open chat');
+    const othersIdx = bar.indexOf('for (const fileName of others)');
+    const openIdx = bar.indexOf('for (const fileName of open)');
+    assert(othersIdx > -1 && openIdx > othersIdx, 'the open chat is deleted LAST');
+    assert(bar.includes('s.replaceCurrentChat()'), 'solo open chat is followed by replaceCurrentChat()');
+    assert(bar.includes('g.deleteGroupChat(groupId'), 'group open chat routes through deleteGroupChat');
+    assert(bar.includes("typeof s.replaceCurrentChat !== 'function'") &&
+           bar.includes("typeof g.deleteGroupChat !== 'function'"),
+        'both repair paths are feature-detected');
+    assert(bar.includes('skippedOpen'), 'a skipped open chat is reported, not silently dropped');
+    // NEGATIVE: the unsafe *ByName helpers must not appear after the open loops
+    assert(bar.indexOf('deleteGroupChatByName') < openIdx,
+        'deleteGroupChatByName is never applied to the open chat');
+    assert(bar.lastIndexOf('deleteCharacterChatByName') < bar.indexOf('s.replaceCurrentChat()'),
+        'the solo open chat is repaired after its delete, not left bare');
+}
+
+console.log('[51] v0.14.0: one canonical scroll container');
+{
+    const gsc = new Function('document', 'getComputedStyle',
+        extract('getScrollContainer') + '\nreturn getScrollContainer;')(document, dom.window.getComputedStyle);
+
+    const popup = document.createElement('div');
+    const mid = document.createElement('div');
+    const proxy = document.createElement('div');
+    popup.appendChild(mid); mid.appendChild(proxy);
+    document.body.appendChild(popup);
+
+    proxy.style.overflowY = 'auto';
+    assert(gsc(popup, proxy) === proxy, 'proxy root itself is the scroller when it overflows');
+
+    proxy.style.overflowY = 'visible';
+    mid.style.overflowY = 'scroll';
+    assert(gsc(popup, proxy) === mid, 'falls back to the nearest scrollable ancestor');
+
+    mid.style.overflowY = 'visible';
+    assert(gsc(popup, proxy) === proxy, 'nothing scrollable -> proxy root, never null');
+    document.body.removeChild(popup);
+
+    const ps = stripCommentsEarly(extract('performSync'));
+    assert(ps.includes('const scroller = getScrollContainer(popup, proxyRoot)'), 'scroller resolved once');
+    assert(ps.includes('initIntersectionObserver(scroller)'), 'lazy observer rooted on the real scroller');
+    assert(ps.includes('scroller.scrollTop = lastScrollTop'), 'scroll restored on the real scroller');
+    assert(ps.includes('scroller.scrollTop || 0'), 'scroll captured from the real scroller');
+    assert(ps.includes('const sameList = listId === lastListIdentity'), 'same-list check gates the restore');
+    assert(ps.includes('lastScrollTop = sameList ?'), 'a different list starts at the top');
+    // NEGATIVE: the class that never existed, and the dead scroll target
+    // comment-stripped: the name survives only in the comment explaining why
+    assert(!stripCommentsEarly(src).includes('shadow_select_chat_popup_body'),
+        'no code path looks for the never-existing popup-body class');
+    assert(!ps.includes('body.scrollTop'), 'no scroll read/write on the non-scrolling popup element');
+}
+
+console.log('[52] v0.14.0: header toggles reconcile from state');
+{
+    const rhs = stripCommentsEarly(extract('refreshHeaderState'));
+    assert(rhs.includes("classList.toggle('tmc_toggle_on', cardsMode)"), 'Cards button painted from cardsMode');
+    assert(rhs.includes('familyView'), 'Families button painted from settings.familyView');
+    assert(rhs.includes("classList.toggle('tmc_toggle_on', bulkMode)"), 'Select button painted from bulkMode');
+    assert(rhs.includes('sel.value !== sortOrder'), 'sort dropdown reconciled too');
+    const ps = stripCommentsEarly(extract('performSync'));
+    // BOTH exit paths must paint: the cardsMode branch returns early, and it is
+    // the very branch where the Cards toggle goes ON.
+    assert((ps.match(/refreshHeaderState\(popup\)/g) || []).length === 2,
+        'reconciliation runs on every sync path, including the cards-mode early return');
+    const cardsIdx = ps.indexOf('if (cardsMode) {');
+    const cardsBlock = ps.slice(cardsIdx, ps.indexOf('return;', cardsIdx));
+    assert(cardsBlock.includes('refreshHeaderState(popup)'), 'cards mode paints the header before returning');
+    assert(cardsBlock.includes("lastListIdentity = 'cards'"), 'cards mode owns its own list identity');
+    // NEGATIVE: self-painting buttons are what desynced from the cardsMode
+    // reset in syncPanelVisibility
+    const iab = stripCommentsEarly(extract('injectAddButton'));
+    assert(!iab.includes("cardsBtn.classList.toggle('tmc_toggle_on'"), 'Cards button does not self-paint');
+    assert(!iab.includes("famBtn.classList.toggle('tmc_toggle_on'"), 'Families button does not self-paint');
+    assert(!iab.includes('if (cardsMode) cardsBtn.classList.add'), 'no create-time Cards state');
+    assert(!iab.includes('if (getSettings().familyView) famBtn.classList.add'), 'no create-time Families state');
+}
+
+console.log('[53] v0.14.0: numeric last-message date, locale-proof');
+{
+    const rbd = new Function(extract('resolveBlockDate') + '\nreturn resolveBlockDate;')();
+    assert(rbd('Jul 30, 2026 12:34 PM', 'x') === Date.parse('Jul 30, 2026 12:34 PM'),
+        'parses the native English date cell');
+    assert(rbd('30 juillet 2026 12:34', 'Alice - 2026-07-30@12h34m56s') === Date.parse('2026-07-30T12:34:56'),
+        'unparseable (non-English) cell falls back to the ST filename stamp');
+    assert(rbd('', 'log 2026-07-30 notes') === Date.parse('2026-07-30'), 'plain ISO date in the name works');
+    assert(rbd('', 'no date here') === 0, 'nothing parseable -> 0');
+    assert(Number.isFinite(rbd('garbage', 'garbage')), 'never NaN (would poison Math.max and comparators)');
+    assert(rbd(undefined, undefined) === 0, 'undefined inputs safe');
+
+    const gcm = stripCommentsEarly(extract('getChatMetadata'));
+    assert(gcm.includes('resolveBlockDate('), 'getChatMetadata uses the resolver');
+    // NEGATIVE: the dead formatted-date path and the NaN parse are gone
+    assert(!src.includes('function formatDate('), 'dead formatDate removed');
+    assert(!src.includes('date: formatDate(dateStr)'), 'dead data.date field removed');
+    assert(!gcm.includes('new Date(dateStr).getTime()'), 'the NaN-producing parse is gone');
+}
+
+console.log('[54] v0.14.0: search input resolved by id, not by position');
+{
+    const fsi = new Function('popup', extract('findSearchInput') + '\nreturn findSearchInput(popup);');
+    const popup = document.createElement('div');
+    // reproduce ST's real header order: the hidden import inputs come FIRST
+    const decoy = document.createElement('input');
+    decoy.type = 'text'; decoy.id = 'chat_import_file_type';
+    const real = document.createElement('input');
+    real.type = 'search'; real.id = 'select_chat_search';
+    popup.appendChild(decoy); popup.appendChild(real);
+
+    assert(fsi(popup) === real, 'picks ST search box even when a text input precedes it');
+    // NEGATIVE: the old positional selector really did pick the decoy
+    assert(popup.querySelector('input[type="search"], input[type="text"], .search_input') === decoy,
+        'sanity: the old positional selector picked the hidden import field');
+
+    const bare = document.createElement('div');
+    const s2 = document.createElement('input'); s2.type = 'search';
+    bare.appendChild(s2);
+    assert(fsi(bare) === s2, 'falls back to type=search on exotic builds');
+    assert(fsi(document.createElement('div')) === null, 'no input -> null, no throw');
+
+    const ps = stripCommentsEarly(extract('performSync'));
+    assert(ps.includes('findSearchInput(popup)'), 'performSync uses the resolver');
+    assert(!ps.includes("input[type=\"text\"], .search_input"), 'no positional lookup left');
+}
+
+console.log('[55] v0.14.0: move-to-card cannot overwrite a target chat');
+{
+    const act = new Function('crypto',
+        extract('freshIntegrity') + '\n' + extract('adaptChatForTarget') +
+        '\nreturn adaptChatForTarget;')({ randomUUID: () => 'UUID-1' });
+    const source = [
+        { user_name: 'u', character_name: 'Alice', chat_metadata: { integrity: 'OLD-SLUG', main_chat: 'p' } },
+        { is_user: true, name: 'u', mes: 'hi' },
+        { is_user: false, name: 'Alice', mes: 'hello' },
+        { is_user: false, name: 'Narrator', mes: '...' },
+    ];
+    const out = act(source, 'Alice', 'Bob');
+    assert(out[0].character_name === 'Bob', 'header renamed to target card');
+    assert(out[0].chat_metadata.integrity === 'UUID-1', 'the copy gets a FRESH integrity token');
+    assert(out[0].chat_metadata.main_chat === 'p', 'other header metadata preserved');
+    assert(source[0].chat_metadata.integrity === 'OLD-SLUG', 'source object not mutated');
+    assert(out[2].name === 'Bob' && out[3].name === 'Narrator', 'only the source card speaker is renamed');
+    assert(out[1].name === 'u', 'user messages untouched');
+    const noMeta = act([{ user_name: 'u', character_name: 'Alice' }], 'Alice', 'Bob');
+    assert(noMeta[0].character_name === 'Bob' && !('chat_metadata' in noMeta[0]),
+        'a header without metadata does not gain an empty one');
+
+    const mv = stripCommentsEarly(extract('moveChatToCharacter'));
+    assert(mv.includes('await targetChatExists(target.avatar, candidate)'), 'destination existence is probed');
+    assert(mv.includes('if (!destName)'), 'no free name found -> refuse rather than overwrite');
+    // NEGATIVE: forcing the write is what disabled the server-side guard
+    assert(!mv.includes('force: true'), 'the write is no longer forced');
+    const tce = stripCommentsEarly(extract('targetChatExists'));
+    assert(tce.includes('return true'), 'a failed probe counts as "exists" (never guesses toward overwrite)');
+}
+
+console.log('[56] v0.14.0: bookkeeping survives deletes that bypass TMC');
+{
+    const init = stripCommentsEarly(extract('init'));
+    assert(init.includes("'CHAT_DELETED', 'GROUP_CHAT_DELETED'"), 'both delete events subscribed');
+    assert(init.includes('stripDeletedFromFolders(settings, charKey, [id])'),
+        'external deletes run the canonical cleanup');
+    assert(init.includes('ctx.event_types[evName]'), 'feature-detected like the other event hooks');
+}
+
+console.log('[57] v0.14.0: bulk folder moves write once');
+{
+    const mc = stripCommentsEarly(extract('moveChats'));
+    assert((mc.match(/saveSettings\(\)/g) || []).length === 1, 'exactly one settings write per bulk move');
+    assert((mc.match(/scheduleSync\(\)/g) || []).length === 1, 'exactly one render per bulk move');
+    assert(mc.includes('new Set(list.map(normalizeChatId))'), 'normalized on both sides');
+    // NEGATIVE: no caller may loop the single-chat helper any more
+    assert(!src.includes('files.forEach(f => moveChat(f'), 'new-folder path no longer loops moveChat');
+    assert(!src.includes('selectedChats.forEach(file => moveChat(file'), 'bulk path no longer loops moveChat');
+    const one = stripCommentsEarly(extract('moveChat'));
+    assert(one.includes('moveChats([fileName], targetFolderId)') && !one.includes('saveSettings'),
+        'single-chat move delegates — one implementation only');
+
+    const settings = {
+        folders: { f1: { name: 'A', chats: ['x', 'y.jsonl'] }, f2: { name: 'B', chats: [] } },
+        characterFolders: { 'c.png': ['f1', 'f2'] },
+    };
+    const mk = new Function('settings',
+        'function getSettings(){return settings;} function getCurrentCharacterId(){return "c.png";}' +
+        'function saveSettings(){} function scheduleSync(){}' +
+        extract('normalizeChatId') + '\n' + extract('moveChats') +
+        '\nreturn moveChats;');
+    mk(settings)(['x', 'y'], 'f2');
+    assert(settings.folders.f1.chats.length === 0, 'both chats left the old folder (extension-insensitive)');
+    assert(settings.folders.f2.chats.slice().sort().join(',') === 'x,y', 'both landed in the new folder, normalized');
+}
+
+console.log('[58] v0.14.0: proxy button clicks survive SVG-mode FontAwesome');
+{
+    const proxy = stripCommentsEarly(extract('createProxyBlock'));
+    assert(proxy.includes('target.classList && target.classList.length'),
+        'class fallback reads classList (defined on SVG elements too)');
+    assert(proxy.includes('CSS.escape(parts[0])'), 'the derived selector is escaped');
+    // NEGATIVE: className.split on an SVGAnimatedString threw, killing the click
+    assert(!proxy.includes('target.className.split'), 'no className.split left');
+    assert(!proxy.includes('clickedClass.split'), 'the duplicate last-resort path is gone');
+}
+
+console.log('[59] v0.14.0: CSS contract — every class the JS applies is styled');
+{
+    const css = readFileSync('./style.css', 'utf8');
+    // Classes TMC creates itself and relies on for appearance. A class the JS
+    // sets but the stylesheet never mentions is an invisible feature — exactly
+    // what a DOM-built highlight span would have been without .tmc_hl.
+    const owned = [
+        'tmc_hl', 'tmc_toggle_on', 'tmc_btn_muted', 'tmc_flash', 'tmc_active',
+        'tmc_pinned', 'tmc_selected', 'tmc_has_active', 'tmc_context_preview',
+        'tmc_activity_hint', 'tmc_branch_chip', 'tmc_active_chip', 'tmc_pin_icon',
+        'tmc_bulk_check', 'tmc_show_more', 'tmc_sentinel', 'tmc_back_btn',
+        'tmc_cards_note', 'tmc_card_chat', 'tmc_card_chat_title',
+        'tmc_card_chat_preview', 'tmc_charpicker_filter', 'tmc_ctx_current',
+        'tmc_ctx_head', 'tmc_ctx_item', 'tmc_ctx_sep', 'tmc_mobile_menu',
+    ];
+    const missing = owned.filter(c => src.includes(c) && !css.includes('.' + c));
+    assert(missing.length === 0, 'no JS-applied class is left unstyled' +
+        (missing.length ? ' (missing: ' + missing.join(', ') + ')' : ''));
+
+    // NEGATIVE side: no stylesheet rule may target a popup element that does
+    // not exist in ST — that is how the scroll bug hid for three releases.
+    assert(!css.includes('select_chat_popup_body'), 'no rules for the non-existent popup body element');
+    assert(!css.includes('#tmc_proxy_root #select_chat_div'), 'no contradictory native-list rules');
+
+    // the stylesheet stamp tracks the manifest like the two JS stamps do
+    const manifest = JSON.parse(readFileSync('./manifest.json', 'utf8'));
+    assert(css.includes(`Styles v${manifest.version} `), `stylesheet stamp matches manifest (${manifest.version})`);
+}
+
+
+console.log('[60] v0.15.0: buildBeginningPreview — beginning of the last output, not the tail');
+{
+    const buildBeginningPreview = new Function(extract('buildBeginningPreview') + '\nreturn buildBeginningPreview;')();
+    const long = 'Start of a very long message. ' + 'x'.repeat(500);
+    assert(buildBeginningPreview(['one', 'two', long]) === long.slice(0, 400),
+        'long last message yields its FIRST 400 chars (server preview was its LAST 400)');
+    assert(buildBeginningPreview(['older turn', '  Line one.\n\nLine   two.  ']) === 'Line one. Line two.',
+        'whitespace/newlines collapsed into one visual line');
+    assert(buildBeginningPreview(['short message']) === 'short message', 'short message passes through whole');
+    assert(buildBeginningPreview([]) === null, 'no messages -> null (caller keeps native preview)');
+    assert(buildBeginningPreview(null) === null, 'non-array -> null');
+    assert(buildBeginningPreview(['   ']) === null, 'blank last message -> null');
+    assert(buildBeginningPreview(['a', 'b'], 5) === 'b', 'maxChars respected');
+}
+
+console.log('[61] v0.15.0: enrichPreviewWithBeginning — fetch once, apply beginning, cache');
+await (async () => {
+    const findPreviewElement = new Function(extract('findPreviewElement') + '\nreturn findPreviewElement;')();
+    const buildBeginningPreview = new Function(extract('buildBeginningPreview') + '\nreturn buildBeginningPreview;')();
+    const ewbSrc = extract('enrichPreviewWithBeginning');
+    const messages = ['first turn', 'second turn', 'The tavern door creaks open and she looks up.'];
+    const beginningCache = {};
+    let fetchCalls = 0;
+
+    const mkBlock = () => {
+        const el = document.createElement('div');
+        el.innerHTML = '<div class="select_chat_block_filename">Chat 1</div><div class="select_chat_block_mes">\u2026tail of the last message</div>';
+        document.body.appendChild(el); // isConnected === true
+        return el;
+    };
+    const mkEnrich = (msgs) => new Function('fetchChatMessages', 'contentCacheKey', 'findPreviewElement', 'buildBeginningPreview', 'beginningPreviewCache',
+        ewbSrc + '\nreturn enrichPreviewWithBeginning;')(
+        async () => { fetchCalls++; return msgs; },
+        (f) => 'C::' + f,
+        findPreviewElement,
+        buildBeginningPreview,
+        beginningCache);
+    const ewb = mkEnrich(messages);
+
+    // A. cache miss -> one fetch -> beginning applied asynchronously
+    const el1 = mkBlock();
+    ewb(el1, 'Chat 1', null);
+    assert(fetchCalls === 1, 'cache miss fetches once');
+    await new Promise(r => setTimeout(r, 0));
+    assert(el1.querySelector('.select_chat_block_mes').textContent === messages[2],
+        'tail preview replaced with the BEGINNING of the last message');
+    assert(beginningCache['C::Chat 1'] === messages[2], 'beginning stored in the cache');
+
+    // B. cache hit -> synchronous apply, no refetch (no tail flash on re-render)
+    const el2 = mkBlock();
+    ewb(el2, 'Chat 1', null);
+    assert(fetchCalls === 1, 'cache hit does not refetch');
+    assert(el2.querySelector('.select_chat_block_mes').textContent === messages[2],
+        'cache hit applies synchronously');
+
+    // C. a block detached mid-flight (re-rendered) is never written
+    const el3 = document.createElement('div');
+    el3.innerHTML = '<div class="select_chat_block_mes">\u2026tail</div>';
+    ewb(el3, 'Detached Chat', null);
+    await new Promise(r => setTimeout(r, 0));
+    assert(fetchCalls === 2, 'detached case still fetched (result is cached for the live block)');
+    assert(el3.querySelector('.select_chat_block_mes').textContent === '\u2026tail',
+        'detached block keeps its text');
+    assert(beginningCache['C::Detached Chat'] === messages[2], 'its result still landed in the cache');
+
+    // D. empty chat -> native preview kept, and never retried per sync
+    const ewbEmpty = mkEnrich([]);
+    const el4 = mkBlock();
+    ewbEmpty(el4, 'Empty Chat', null);
+    await new Promise(r => setTimeout(r, 0));
+    assert(el4.querySelector('.select_chat_block_mes').textContent === '\u2026tail of the last message',
+        'empty chat keeps the native preview');
+    ewbEmpty(el4, 'Empty Chat', null);
+    assert(fetchCalls === 3, 'known-empty is not refetched on every sync');
+})();
+
+console.log('[62] v0.15.0: beginning preview wired outside search; single-open click path');
+{
+    const cpb = stripComments(extract('createProxyBlock'));
+    assert(/!searchTerm && \(\(chatData\.metadata && chatData\.metadata\.size\) \|\| 0\) <= ENRICH_MAX_BYTES\)\s*\{\s*enrichPreviewWithBeginning\(el, chatData\.fileName, getTitleEl\(el\)\)/.test(cpb),
+        'beginning enrichment wired outside search with the shared size guard');
+    assert((cpb.match(/const ENRICH_MAX_BYTES = 4 \* 1024 \* 1024;/g) || []).length === 1,
+        'size budget hoisted and declared exactly once');
+
+    assert(/e\.stopPropagation\(\);\s*openTarget\.click\(\)/.test(cpb),
+        'forwarded open is the single open path (proxy click stopped from reaching the delegated opener)');
+    assert(!cpb.includes('(findNativeBlock(chatData.fileName) || chatData.element).click();'),
+        'unconditional forward-and-bubble is gone');
+    assert(cpb.includes('openTarget.isConnected'),
+        'only a live native block suppresses the bubble (stale block still opens via delegation)');
+}
+
+console.log('[63] v0.15.0: message events invalidate preview/content caches');
+{
+    const initSrc = stripComments(extract('init'));
+    assert(/ctx\.eventSource\.on\(ctx\.event_types\[evName\], \(\) => \{[^}]*invalidateChatContentCaches\(\)/.test(initSrc),
+        'message-event handler invalidates the caches');
+    assert(!initSrc.includes('eventSource.on(ctx.event_types[evName], stampActivity)'),
+        'bare stampActivity subscription replaced');
+
+    const cc = { 'C::a': ['x'] }, order = ['C::a'], bc = { 'C::a': 'y' };
+    const inv = new Function('chatContentCache', 'contentCacheOrder', 'beginningPreviewCache',
+        extract('invalidateChatContentCaches') + '\nreturn invalidateChatContentCaches;')(cc, order, bc);
+    inv();
+    assert(Object.keys(cc).length === 0 && order.length === 0 && Object.keys(bc).length === 0,
+        'invalidation empties content cache, LRU order, and beginning cache');
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

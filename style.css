@@ -1,5 +1,5 @@
 /**
- * Too Many Chats - Styles v2.1.1 (Maintenance Hotfix)
+ * Too Many Chats - Styles v0.15.0 (aligned with extension version)
  * ChatGPT-inspired clean layout with SillyTavern theme integration
  */
 
@@ -67,16 +67,6 @@
     align-items: center !important;
     justify-content: center !important;
     margin: 0 !important;
-}
-
-#select_chat_popup_body {
-    display: flex !important;
-    flex-direction: column !important;
-    padding: 0 !important;
-    overflow: hidden !important;
-    flex: 1 1 auto !important;
-    height: 100% !important;
-    position: relative !important;
 }
 
 /* ========== NEW FOLDER BUTTON (Header) ========== */
@@ -592,12 +582,6 @@
         /* Keep blur, lose the gradient/shadow */
     }
 
-    #select_chat_popup_body {
-        flex: 1 1 auto !important;
-        height: auto !important;
-        overflow: hidden !important;
-    }
-
 
     #shadow_select_chat_popup[style]:not([style*="display: none"]) {
         position: fixed !important;
@@ -812,9 +796,15 @@
     transform: rotate(-90deg);
 }
 
-.tmc_family_btn.tmc_toggle_on {
+/* v0.14.0: every header toggle (Families, Cards, Select) is painted from
+   state by refreshHeaderState, so they all share one treatment. */
+.tmc_add_btn.tmc_toggle_on {
     background: color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 25%, transparent) !important;
     box-shadow: inset 0 0 0 1px var(--SmartThemeQuoteColor, #e0a044);
+}
+
+.tmc_add_btn.tmc_btn_muted {
+    opacity: 0.45;
 }
 
 /* ========== v0.11.0: JUMP-TO-OPEN FLASH ========== */
@@ -886,4 +876,100 @@
     vertical-align: middle;
     pointer-events: none;
     white-space: nowrap;
+}
+
+
+/* ================= v0.14.0 ================= */
+
+/* Search highlight. Required by applyHighlight() — highlighting is built from
+   DOM nodes now, so the styling lives here instead of an inline style
+   attribute. The old inline rule hardcoded `color: #fff` over a pale yellow
+   wash, which was effectively invisible on light themes; this derives entirely
+   from the active SillyTavern theme. */
+.tmc_hl {
+    padding: 0 1px;
+    border-radius: 3px;
+    font-weight: 700;
+    color: var(--SmartThemeQuoteColor, #e0a044);
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 20%, transparent);
+    box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 55%, transparent);
+}
+
+/* Section headers stay put while their rows scroll under them, so on a long
+   list you can always see which folder / lineage you are inside. Works
+   because #tmc_proxy_root is the scroll container (see getScrollContainer). */
+#tmc_proxy_root .tmc_section > .tmc_header {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    backdrop-filter: blur(6px);
+    background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #1b1b1b) 82%, transparent);
+}
+
+/* The open chat should be findable at a glance without reading any text. */
+.tmc_proxy_block.tmc_active {
+    box-shadow: inset 3px 0 0 var(--SmartThemeQuoteColor, #e0a044);
+}
+
+/* Pinned rows get a quiet left rail rather than relying on the 📌 glyph alone. */
+.tmc_proxy_block.tmc_pinned {
+    box-shadow: inset 2px 0 0 color-mix(in srgb, var(--SmartThemeQuoteColor, #e0a044) 45%, transparent);
+}
+
+.tmc_context_preview {
+    font-style: italic;
+    opacity: 0.9;
+}
+
+/* Row rhythm: the native block template is built for a full-width list, which
+   reads as a dense wall inside a folder tree. */
+#tmc_proxy_root .tmc_proxy_block.select_chat_block {
+    transition: background 120ms ease, box-shadow 120ms ease;
+}
+
+#tmc_proxy_root .tmc_content > .tmc_proxy_block:first-child {
+    margin-top: 3px;
+}
+
+/* Comfortable touch targets on a phone without changing desktop density. */
+@media screen and (max-width: 768px) {
+    #tmc_proxy_root .tmc_header {
+        min-height: 38px;
+    }
+
+    .tmc_ctx_item {
+        min-height: 40px;
+        display: flex;
+        align-items: center;
+    }
+
+    .tmc_mobile_menu {
+        min-width: 34px;
+        min-height: 34px;
+    }
+}
+
+/* Respect the OS reduced-motion preference for the jump flash. */
+@media (prefers-reduced-motion: reduce) {
+    .tmc_proxy_block.tmc_flash {
+        animation: none;
+        box-shadow: inset 0 0 0 2px var(--SmartThemeQuoteColor, #e0a044);
+    }
+}
+
+/* Presentation for two elements that used to carry inline styles from JS. The
+   sentinel needs a real box for the IntersectionObserver to intersect. */
+.tmc_pin_icon {
+    font-size: 12px;
+    margin-right: 5px;
+    opacity: 0.8;
+    vertical-align: middle;
+}
+
+.tmc_sentinel {
+    height: 20px;
+    line-height: 20px;
+    text-align: center;
+    font-size: 12px;
+    opacity: 0.5;
 }
